@@ -1,3 +1,5 @@
+// Command server is the process entrypoint: wires in-memory store → service →
+// HTTP API and listens for requests. No external infrastructure required.
 package main
 
 import (
@@ -11,6 +13,7 @@ import (
 )
 
 func main() {
+	// Composition root: concrete MemoryStore behind the Store interface.
 	st := store.NewMemoryStore()
 	svc := service.NewService(st)
 	api := httpapi.NewServer(svc)

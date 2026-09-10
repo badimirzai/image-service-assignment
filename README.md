@@ -21,11 +21,49 @@ Target: code you would be comfortable merging to main, with motivated tradeoffs 
 # Run the server (default :8080; override with PORT)
 go run ./cmd/server
 
-# Health check (currently the only live route)
+# Health check
 curl -s http://localhost:8080/healthz
+
+# Upload an image (raw body)
+curl -s -D - -X POST http://localhost:8080/v1/images --data-binary @path/to/image.png
+
+# List metadata
+curl -s http://localhost:8080/v1/images
 ```
 
-Image API routes are not implemented yet; this section will grow with curl examples as endpoints land.
+**Example**
+```bash
+#post data 
+curl -s -D - -X POST http://localhost:8080/v1/images --data-binary @test-images/mario.png
+```
+
+```bash
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: /v1/images/1
+Date: Thu, 10 Sep 2026 13:44:28 GMT
+Content-Length: 110
+
+```
+
+Verify 
+````bash
+#GET data
+curl -s http://localhost:8080/v1/images
+````
+```json
+[
+  {
+    "id": 1,
+    "filesize": 434232,
+    "width": 1200,
+    "height": 1098,
+    "image_type": "png",
+    "upload_date": "2026-09-10T13:44:28Z"
+  }
+]
+
+```
 
 **Tests** (as they are added):
 
@@ -93,7 +131,7 @@ Locked decisions from the assignment review and clarifying discussions.
 ### Trust, validation, storage
 
 - **Validation and metadata extraction live in the service**, shared by POST, PUT, and batch. Storage does not understand formats.
-- **Do not trust client `Content-Type` / filename** — derive format, dimensions, and filesize from decoded bytes (stdlib `image`).
+- **Do not trust client `Content-Type` / filename** - derive format, dimensions, and filesize from decoded bytes (stdlib `image`).
 - **HTTP edge** may enforce the same max size via `http.MaxBytesReader` (DoS protection); service still owns the limit policy.
 - **Store holds opaque bytes** + service-derived metadata. **Original upload bytes are stored unchanged**; re-encode only for derived responses (bbox).
 
@@ -102,7 +140,7 @@ Locked decisions from the assignment review and clarifying discussions.
 - **POST creates; PUT replaces existing only** → missing ID returns **404** (not upsert).
 - **Formats:** JPEG, PNG, GIF.
 - **Limits (initial):** ~10 MiB per image; batch size capped (e.g. 20); fixed worker pool for batch.
-- **`bbox`:** read-time only — decode stored original, validate coords (top-left, strict in-bounds → 400 if invalid), crop, encode response. Does **not** mutate storage.
+- **`bbox`:** read-time only - decode stored original, validate coords (top-left, strict in-bounds → 400 if invalid), crop, encode response. Does **not** mutate storage.
 - **Batch:** partial success (`success` + `errors`); fixed-size worker pool; cancel via `r.Context()` on disconnect (stop scheduling / skip further writes). Per-item failures do **not** cancel the batch. Already-stored items before disconnect may remain (no compensating deletes).
 
 ### HTTP status cheat sheet
@@ -136,9 +174,8 @@ Errors: `{"error":"..."}`. Image responses set `Content-Type` / `Content-Length`
 
 ## Current status
 
-- Runnable skeleton: `go run ./cmd/server` → `GET /healthz`
-- Image endpoints not implemented yet
-- Persistence: in-memory only
+- `GET /healthz`, `GET /v1/images`, `POST /v1/images` implemented (in-memory)
+- PUT, get-by-id, `/data`, bbox, and batch not implemented yet
 
 ---
 
