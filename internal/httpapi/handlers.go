@@ -10,6 +10,8 @@ import (
 	"net/http"
 
 	"github.com/badimirzai/image-service/internal/service"
+	"github.com/badimirzai/image-service/internal/store"
+	"strconv"
 )
 
 // Server wires HTTP handlers to the image service.
@@ -27,6 +29,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /v1/images", s.handleListImages)
 	mux.HandleFunc("POST /v1/images", s.handleCreateImage)
+	mux.HandleFunc("GET /v1/images/{id}/data", s.handleGetImageData)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -41,6 +44,44 @@ func (s *Server) handleListImages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, list)
+}
+
+// handleGetImageData returns the raw image bytes for the given ID (not JSON).
+func (s *Server) handleGetImageData(w http.ResponseWriter, r *http.Request) {
+	idstr := r.PathValue("id")
+	id, err := strconv.ParseInt(idstr, 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid image ID")
+		return
+	}
+	record, err := s.svc.GetImageData(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "image not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+
+	w.Header().Set("Content-Type", contentTypeFor(record.Metadata.ImageType))
+	w.Header().Set("Content-Length", strconv.Itoa(len(record.Bytes)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(record.Bytes)
+}
+
+// helper function to get the content type for the image type
+func contentTypeFor(imageType string) string {
+	switch imageType {
+	case "jpeg":
+		return "image/jpeg"
+	case "png":
+		return "image/png"
+	case "gif":
+		return "image/gif"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 // handleCreateImage accepts raw image bytes in the request body

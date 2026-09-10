@@ -38,6 +38,8 @@ type Store interface {
 	// Create assigns a server-side integer ID, persists data unchanged, and
 	// returns the stored metadata (including the new ID).
 	Create(ctx context.Context, meta Metadata, data []byte) (Metadata, error)
+	// Get returns one image record (metadata + original bytes) by ID.
+	Get(ctx context.Context, id int64) (ImageRecord, error)
 	// List returns metadata for all images (no bytes). Empty store → empty slice.
 	List(ctx context.Context) ([]Metadata, error)
 }
@@ -83,6 +85,27 @@ func (s *MemoryStore) Create(ctx context.Context, meta Metadata, data []byte) (M
 		Bytes:    cp,
 	}
 	return meta, nil
+}
+
+// Get returns the stored record for id, or ErrNotFound.
+func (s *MemoryStore) Get(ctx context.Context, id int64) (ImageRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return ImageRecord{}, err
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rec, ok := s.records[id]
+	if !ok {
+		return ImageRecord{}, ErrNotFound
+	}
+	// Return a copy of bytes so callers cannot mutate the store's slice.
+	cp := make([]byte, len(rec.Bytes))
+	copy(cp, rec.Bytes)
+	out := rec
+	out.Bytes = cp
+	return out, nil
 }
 
 // List returns metadata for all images, newest (highest ID) first.

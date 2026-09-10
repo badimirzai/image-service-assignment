@@ -61,6 +61,15 @@ func (s *Service) ListImages(ctx context.Context) ([]store.Metadata, error) {
 	return list, nil
 }
 
+// GetImageData returns the stored image record for id (metadata + original bytes).
+func (s *Service) GetImageData(ctx context.Context, id int64) (store.ImageRecord, error) {
+	record, err := s.store.Get(ctx, id)
+	if err != nil {
+		return store.ImageRecord{}, err
+	}
+	return record, nil
+}
+
 // CreateImage validates that data is a supported image, derives metadata from
 // the bytes themselves (not from Content-Type), and stores the original payload
 // unchanged. Supported formats: JPEG, PNG, GIF.
