@@ -154,3 +154,34 @@ func TestListImagesEmpty(t *testing.T) {
 		t.Fatalf("got %#v, want empty non-nil slice", list)
 	}
 }
+
+func TestGetImageData(t *testing.T) {
+	st := store.NewMemoryStore()
+	svc := service.NewService(st)
+	ctx := context.Background()
+	data := testPNG(t, 5, 5)
+
+	meta, err := svc.CreateImage(ctx, data)
+	if err != nil {
+		t.Fatalf("CreateImage: %v", err)
+	}
+
+	rec, err := svc.GetImageData(ctx, meta.ID)
+	if err != nil {
+		t.Fatalf("GetImageData: %v", err)
+	}
+	if !bytes.Equal(rec.Bytes, data) {
+		t.Fatalf("bytes mismatch")
+	}
+	if rec.Metadata.ImageType != "png" || rec.Metadata.ID != meta.ID {
+		t.Fatalf("unexpected metadata: %+v", rec.Metadata)
+	}
+}
+
+func TestGetImageDataNotFound(t *testing.T) {
+	svc := service.NewService(store.NewMemoryStore())
+	_, err := svc.GetImageData(context.Background(), 42)
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}

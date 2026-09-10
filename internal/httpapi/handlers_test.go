@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/gif"
 	"image/jpeg"
 	"image/png"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/badimirzai/image-service/internal/httpapi"
@@ -205,5 +207,76 @@ func TestCreateImageTooLarge(t *testing.T) {
 	app.handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status=%d, want 413", rec.Code)
+	}
+}
+
+func TestGetImageData(t *testing.T) {
+	cases := []struct {
+		name        string
+		data        []byte
+		contentType string
+	}{
+		{"png", testPNG(t, 3, 2), "image/png"},
+		{"jpeg", testJPEG(t, 4, 4), "image/jpeg"},
+		{"gif", testGIF(t, 2, 3), "image/gif"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			app := newTestApp(t)
+
+			postReq := httptest.NewRequest(http.MethodPost, "/v1/images", bytes.NewReader(tc.data))
+			postRec := httptest.NewRecorder()
+			app.handler.ServeHTTP(postRec, postReq)
+			if postRec.Code != http.StatusCreated {
+				t.Fatalf("POST status=%d body=%s", postRec.Code, postRec.Body.String())
+			}
+
+			var meta store.Metadata
+			if err := json.NewDecoder(postRec.Body).Decode(&meta); err != nil {
+				t.Fatalf("decode create: %v", err)
+			}
+
+			getReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v1/images/%d/data", meta.ID), nil)
+			getRec := httptest.NewRecorder()
+			app.handler.ServeHTTP(getRec, getReq)
+
+			if getRec.Code != http.StatusOK {
+				t.Fatalf("GET data status=%d body=%s", getRec.Code, getRec.Body.String())
+			}
+			if ct := getRec.Header().Get("Content-Type"); ct != tc.contentType {
+				t.Fatalf("Content-Type=%q, want %q", ct, tc.contentType)
+			}
+			if cl := getRec.Header().Get("Content-Length"); cl != strconv.Itoa(len(tc.data)) {
+				t.Fatalf("Content-Length=%q, want %d", cl, len(tc.data))
+			}
+			if !bytes.Equal(getRec.Body.Bytes(), tc.data) {
+				t.Fatalf("body bytes do not match uploaded image")
+			}
+			// Must be raw bytes, not a JSON envelope.
+			if bytes.HasPrefix(bytes.TrimSpace(getRec.Body.Bytes()), []byte("{")) {
+				t.Fatalf("expected raw image bytes, got JSON-looking body")
+			}
+		})
+	}
+}
+
+func TestGetImageDataNotFound(t *testing.T) {
+	app := newTestApp(t)
+	req := httptest.NewRequest(http.MethodGet, "/v1/images/99/data", nil)
+	rec := httptest.NewRecorder()
+	app.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404", rec.Code)
+	}
+}
+
+func TestGetImageDataInvalidID(t *testing.T) {
+	app := newTestApp(t)
+	req := httptest.NewRequest(http.MethodGet, "/v1/images/abc/data", nil)
+	rec := httptest.NewRecorder()
+	app.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400", rec.Code)
 	}
 }
