@@ -19,6 +19,7 @@ import (
 	"github.com/badimirzai/image-service/internal/store"
 )
 
+// Tiny generated fixtures — no binary image files in the repo
 func testPNG(t *testing.T, w, h int) []byte {
 	t.Helper()
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
@@ -49,9 +50,10 @@ func testGIF(t *testing.T, w, h int) []byte {
 	return buf.Bytes()
 }
 
+// testApp wires memory store → service → mux like cmd/server, for httptest tests.
 type testApp struct {
 	handler http.Handler
-	store   store.Store
+	store   store.Store // exposed so tests can assert persisted bytes via the store boundary
 }
 
 func newTestApp(t *testing.T) testApp {
@@ -62,6 +64,7 @@ func newTestApp(t *testing.T) testApp {
 	return testApp{handler: mux, store: st}
 }
 
+// TestListImagesEmpty: GET /v1/images on empty store → 200 + [].
 func TestListImagesEmpty(t *testing.T) {
 	app := newTestApp(t)
 	req := httptest.NewRequest(http.MethodGet, "/v1/images", nil)
@@ -84,6 +87,7 @@ func TestListImagesEmpty(t *testing.T) {
 	}
 }
 
+// TestCreateImageFormats: POST raw body for each supported format → 201, Location, metadata, stored bytes.
 func TestCreateImageFormats(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -142,6 +146,7 @@ func TestCreateImageFormats(t *testing.T) {
 	}
 }
 
+// TestCreateAndListImages: POST then GET list returns the created metadata.
 func TestCreateAndListImages(t *testing.T) {
 	app := newTestApp(t)
 	data := testPNG(t, 2, 2)
@@ -177,6 +182,7 @@ func TestCreateAndListImages(t *testing.T) {
 	}
 }
 
+// TestCreateImageInvalid: garbage / empty body → 400.
 func TestCreateImageInvalid(t *testing.T) {
 	app := newTestApp(t)
 
@@ -199,6 +205,7 @@ func TestCreateImageInvalid(t *testing.T) {
 	})
 }
 
+// TestCreateImageTooLarge: body over MaxImageSize → 413 at the HTTP edge.
 func TestCreateImageTooLarge(t *testing.T) {
 	app := newTestApp(t)
 	huge := bytes.NewReader(make([]byte, service.MaxImageSize+1))
@@ -210,6 +217,7 @@ func TestCreateImageTooLarge(t *testing.T) {
 	}
 }
 
+// TestGetImageData: GET /data returns raw image bytes (not JSON) with correct Content-Type/Length.
 func TestGetImageData(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -261,6 +269,7 @@ func TestGetImageData(t *testing.T) {
 	}
 }
 
+// TestGetImageDataNotFound: unknown id → 404.
 func TestGetImageDataNotFound(t *testing.T) {
 	app := newTestApp(t)
 	req := httptest.NewRequest(http.MethodGet, "/v1/images/99/data", nil)
@@ -271,6 +280,7 @@ func TestGetImageDataNotFound(t *testing.T) {
 	}
 }
 
+// TestGetImageDataInvalidID: non-integer path id → 400.
 func TestGetImageDataInvalidID(t *testing.T) {
 	app := newTestApp(t)
 	req := httptest.NewRequest(http.MethodGet, "/v1/images/abc/data", nil)
@@ -281,6 +291,7 @@ func TestGetImageDataInvalidID(t *testing.T) {
 	}
 }
 
+// TestGetImageMetadata: GET /v1/images/{id} returns JSON metadata matching create.
 func TestGetImageMetadata(t *testing.T) {
 	app := newTestApp(t)
 	data := testPNG(t, 3, 2)
@@ -317,6 +328,7 @@ func TestGetImageMetadata(t *testing.T) {
 	}
 }
 
+// TestGetImageMetadataNotFound: unknown id → 404.
 func TestGetImageMetadataNotFound(t *testing.T) {
 	app := newTestApp(t)
 	req := httptest.NewRequest(http.MethodGet, "/v1/images/99", nil)
@@ -327,6 +339,7 @@ func TestGetImageMetadataNotFound(t *testing.T) {
 	}
 }
 
+// TestGetImageMetadataInvalidID: non-integer path id → 400.
 func TestGetImageMetadataInvalidID(t *testing.T) {
 	app := newTestApp(t)
 	req := httptest.NewRequest(http.MethodGet, "/v1/images/abc", nil)
@@ -337,6 +350,7 @@ func TestGetImageMetadataInvalidID(t *testing.T) {
 	}
 }
 
+// TestUpdateImage: PUT replaces payload/metadata, keeps upload_date, updates /data bytes.
 func TestUpdateImage(t *testing.T) {
 	app := newTestApp(t)
 	original := testPNG(t, 2, 2)
@@ -385,6 +399,7 @@ func TestUpdateImage(t *testing.T) {
 	}
 }
 
+// TestUpdateImageInvalidFormat: unsupported replacement body → 400 with clear error text.
 func TestUpdateImageInvalidFormat(t *testing.T) {
 	app := newTestApp(t)
 	original := testPNG(t, 2, 2)
@@ -407,6 +422,7 @@ func TestUpdateImageInvalidFormat(t *testing.T) {
 	}
 }
 
+// TestUpdateImageNotFound: PUT to missing id → 404 (no upsert).
 func TestUpdateImageNotFound(t *testing.T) {
 	app := newTestApp(t)
 	data := testPNG(t, 2, 2)
@@ -418,6 +434,7 @@ func TestUpdateImageNotFound(t *testing.T) {
 	}
 }
 
+// TestUpdateImageTooLarge: oversized PUT body → 413.
 func TestUpdateImageTooLarge(t *testing.T) {
 	app := newTestApp(t)
 	original := testPNG(t, 2, 2)
@@ -437,6 +454,7 @@ func TestUpdateImageTooLarge(t *testing.T) {
 	}
 }
 
+// TestUpdateImageInvalidID: non-integer path id → 400.
 func TestUpdateImageInvalidID(t *testing.T) {
 	app := newTestApp(t)
 	putReq := httptest.NewRequest(http.MethodPut, "/v1/images/abc", bytes.NewReader(testPNG(t, 1, 1)))
@@ -446,3 +464,88 @@ func TestUpdateImageInvalidID(t *testing.T) {
 		t.Fatalf("status=%d, want 400", putRec.Code)
 	}
 }
+
+// TestGetImageDataBBox: ?bbox=x,y,w,h returns a cropped image; storage stays unchanged.
+func TestGetImageDataBBox(t *testing.T) {
+	app := newTestApp(t)
+	data := testPNG(t, 10, 8)
+
+	postReq := httptest.NewRequest(http.MethodPost, "/v1/images", bytes.NewReader(data))
+	postRec := httptest.NewRecorder()
+	app.handler.ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusCreated {
+		t.Fatalf("POST status=%d", postRec.Code)
+	}
+
+	// bbox=1,2,3,4 → response should decode as 3×4 PNG.
+	getReq := httptest.NewRequest(http.MethodGet, "/v1/images/1/data?bbox=1,2,3,4", nil)
+	getRec := httptest.NewRecorder()
+	app.handler.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", getRec.Code, getRec.Body.String())
+	}
+	if ct := getRec.Header().Get("Content-Type"); ct != "image/png" {
+		t.Fatalf("Content-Type=%q", ct)
+	}
+
+	img, format, err := image.Decode(getRec.Body)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if format != "png" {
+		t.Fatalf("format=%q", format)
+	}
+	if img.Bounds().Dx() != 3 || img.Bounds().Dy() != 4 {
+		t.Fatalf("dims=%v, want 3x4", img.Bounds())
+	}
+
+	// Storage unchanged: full fetch still returns original bytes.
+	fullReq := httptest.NewRequest(http.MethodGet, "/v1/images/1/data", nil)
+	fullRec := httptest.NewRecorder()
+	app.handler.ServeHTTP(fullRec, fullReq)
+	if !bytes.Equal(fullRec.Body.Bytes(), data) {
+		t.Fatal("bbox request mutated stored original")
+	}
+}
+
+// TestGetImageDataBBoxBadRequest: malformed / OOB / zero-size bbox → 400.
+func TestGetImageDataBBoxBadRequest(t *testing.T) {
+	app := newTestApp(t)
+	postReq := httptest.NewRequest(http.MethodPost, "/v1/images", bytes.NewReader(testPNG(t, 5, 5)))
+	postRec := httptest.NewRecorder()
+	app.handler.ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusCreated {
+		t.Fatalf("POST status=%d", postRec.Code)
+	}
+
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"malformed", "/v1/images/1/data?bbox=1,2"},
+		{"out_of_bounds", "/v1/images/1/data?bbox=0,0,10,10"},
+		{"zero_size", "/v1/images/1/data?bbox=0,0,0,1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.url, nil)
+			rec := httptest.NewRecorder()
+			app.handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestGetImageDataBBoxNotFound: bbox on missing id → 404 (not 400).
+func TestGetImageDataBBoxNotFound(t *testing.T) {
+	app := newTestApp(t)
+	req := httptest.NewRequest(http.MethodGet, "/v1/images/99/data?bbox=0,0,1,1", nil)
+	rec := httptest.NewRecorder()
+	app.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404", rec.Code)
+	}
+}
+

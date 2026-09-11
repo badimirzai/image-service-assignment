@@ -10,6 +10,8 @@ import (
 	"github.com/badimirzai/image-service/internal/store"
 )
 
+// TestMemoryStoreCreateGetList covers ID assignment, defensive byte copy,
+// Get round-trip, and newest-first List ordering.
 func TestMemoryStoreCreateGetList(t *testing.T) {
 	st := store.NewMemoryStore()
 	ctx := context.Background()
@@ -68,6 +70,7 @@ func TestMemoryStoreCreateGetList(t *testing.T) {
 	}
 }
 
+// TestMemoryStoreListEmpty ensures an empty store returns a zero-length list, not an error.
 func TestMemoryStoreListEmpty(t *testing.T) {
 	st := store.NewMemoryStore()
 	list, err := st.List(context.Background())
@@ -79,6 +82,7 @@ func TestMemoryStoreListEmpty(t *testing.T) {
 	}
 }
 
+// TestMemoryStoreGetNotFound checks Get returns ErrNotFound for unknown ids.
 func TestMemoryStoreGetNotFound(t *testing.T) {
 	st := store.NewMemoryStore()
 	_, err := st.Get(context.Background(), 99)
@@ -87,6 +91,7 @@ func TestMemoryStoreGetNotFound(t *testing.T) {
 	}
 }
 
+// TestMemoryStoreGetMetadata checks metadata-only fetch and not-found behavior.
 func TestMemoryStoreGetMetadata(t *testing.T) {
 	st := store.NewMemoryStore()
 	ctx := context.Background()
@@ -115,6 +120,8 @@ func TestMemoryStoreGetMetadata(t *testing.T) {
 	}
 }
 
+// TestMemoryStoreConcurrentCreates stresses ID allocation under concurrent Creates
+// (useful with go test -race).
 func TestMemoryStoreConcurrentCreates(t *testing.T) {
 	st := store.NewMemoryStore()
 	ctx := context.Background()

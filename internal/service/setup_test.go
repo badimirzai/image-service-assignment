@@ -14,6 +14,7 @@ import (
 	"github.com/badimirzai/image-service/internal/store"
 )
 
+// testPNG / testJPEG / testGIF build tiny in-memory images so tests need no binary fixtures.
 func testPNG(t *testing.T, w, h int) []byte {
 	t.Helper()
 	img := image.NewRGBA(image.Rect(0, 0, w, h))
@@ -44,6 +45,8 @@ func testGIF(t *testing.T, w, h int) []byte {
 	return buf.Bytes()
 }
 
+// TestCreateImageFormats verifies create derives type/dims/filesize from bytes
+// for JPEG, PNG, and GIF, and persists the original payload unchanged.
 func TestCreateImageFormats(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -94,6 +97,7 @@ func TestCreateImageFormats(t *testing.T) {
 	}
 }
 
+// TestCreateImageAndList checks that a created image appears in ListImages.
 func TestCreateImageAndList(t *testing.T) {
 	svc := service.NewService(store.NewMemoryStore())
 	ctx := context.Background()
@@ -116,6 +120,7 @@ func TestCreateImageAndList(t *testing.T) {
 	}
 }
 
+// TestCreateImageRejectsInvalid covers empty body and undecodable garbage → sentinel errors.
 func TestCreateImageRejectsInvalid(t *testing.T) {
 	svc := service.NewService(store.NewMemoryStore())
 
@@ -135,6 +140,7 @@ func TestCreateImageRejectsInvalid(t *testing.T) {
 	}
 }
 
+// TestCreateImageRejectsTooLarge checks the service-level size limit (beyond HTTP MaxBytesReader).
 func TestCreateImageRejectsTooLarge(t *testing.T) {
 	svc := service.NewService(store.NewMemoryStore())
 	data := make([]byte, service.MaxImageSize+1)
@@ -144,6 +150,7 @@ func TestCreateImageRejectsTooLarge(t *testing.T) {
 	}
 }
 
+// TestListImagesEmpty ensures empty store → non-nil empty slice (JSON []).
 func TestListImagesEmpty(t *testing.T) {
 	svc := service.NewService(store.NewMemoryStore())
 	list, err := svc.ListImages(context.Background())
@@ -155,6 +162,7 @@ func TestListImagesEmpty(t *testing.T) {
 	}
 }
 
+// TestGetImageData returns original bytes + metadata for a known id.
 func TestGetImageData(t *testing.T) {
 	st := store.NewMemoryStore()
 	svc := service.NewService(st)
@@ -178,6 +186,7 @@ func TestGetImageData(t *testing.T) {
 	}
 }
 
+// TestGetImageDataNotFound checks missing id → ErrNotFound.
 func TestGetImageDataNotFound(t *testing.T) {
 	svc := service.NewService(store.NewMemoryStore())
 	_, err := svc.GetImageData(context.Background(), 42)
@@ -186,6 +195,7 @@ func TestGetImageDataNotFound(t *testing.T) {
 	}
 }
 
+// TestGetImageMetadata returns the same metadata produced at create time.
 func TestGetImageMetadata(t *testing.T) {
 	svc := service.NewService(store.NewMemoryStore())
 	ctx := context.Background()
@@ -205,6 +215,7 @@ func TestGetImageMetadata(t *testing.T) {
 	}
 }
 
+// TestGetImageMetadataNotFound checks missing id → ErrNotFound.
 func TestGetImageMetadataNotFound(t *testing.T) {
 	svc := service.NewService(store.NewMemoryStore())
 	_, err := svc.GetImageMetadata(context.Background(), 99)
@@ -213,6 +224,7 @@ func TestGetImageMetadataNotFound(t *testing.T) {
 	}
 }
 
+// TestUpdateImage replaces bytes/type/dims, preserves id + upload_date (no upsert semantics here).
 func TestUpdateImage(t *testing.T) {
 	svc := service.NewService(store.NewMemoryStore())
 	ctx := context.Background()
@@ -244,6 +256,7 @@ func TestUpdateImage(t *testing.T) {
 	}
 }
 
+// TestUpdateImageInvalid rejects non-image replacement payloads.
 func TestUpdateImageInvalid(t *testing.T) {
 	svc := service.NewService(store.NewMemoryStore())
 	ctx := context.Background()
@@ -258,9 +271,101 @@ func TestUpdateImageInvalid(t *testing.T) {
 	}
 }
 
+// TestUpdateImageNotFound ensures PUT does not upsert missing ids.
 func TestUpdateImageNotFound(t *testing.T) {
 	svc := service.NewService(store.NewMemoryStore())
 	_, err := svc.UpdateImage(context.Background(), 99, testPNG(t, 1, 1))
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}
+
+// TestParseBBox covers happy path, whitespace, and invalid x,y,w,h forms.
+func TestParseBBox(t *testing.T) {
+	ok, err := service.ParseBBox("1,2,3,4")
+	if err != nil {
+		t.Fatalf("ParseBBox: %v", err)
+	}
+	if ok != (service.BBox{X: 1, Y: 2, W: 3, H: 4}) {
+		t.Fatalf("got %+v", ok)
+	}
+
+	spaced, err := service.ParseBBox(" 0 , 0 , 10 , 8 ")
+	if err != nil || spaced.W != 10 || spaced.H != 8 {
+		t.Fatalf("spaced: %+v err=%v", spaced, err)
+	}
+
+	// Wrong arity, non-ints, zero/negative size, negative origin.
+	cases := []string{"1,2,3", "a,b,c,d", "0,0,0,1", "0,0,1,0", "-1,0,1,1", "0,-1,1,1"}
+	for _, s := range cases {
+		if _, err := service.ParseBBox(s); !errors.Is(err, service.ErrInvalidBBox) {
+			t.Fatalf("%q: got %v, want ErrInvalidBBox", s, err)
+		}
+	}
+}
+
+// TestGetImageCutout crops to expected dims, re-encodes as the same format,
+// and leaves the stored original untouched (read-time only).
+func TestGetImageCutout(t *testing.T) {
+	svc := service.NewService(store.NewMemoryStore())
+	ctx := context.Background()
+	data := testPNG(t, 10, 8)
+
+	created, err := svc.CreateImage(ctx, data)
+	if err != nil {
+		t.Fatalf("CreateImage: %v", err)
+	}
+
+	cut, err := svc.GetImageCutout(ctx, created.ID, service.BBox{X: 2, Y: 1, W: 4, H: 3})
+	if err != nil {
+		t.Fatalf("GetImageCutout: %v", err)
+	}
+	if cut.Metadata.Width != 4 || cut.Metadata.Height != 3 {
+		t.Fatalf("cutout meta dims=%dx%d", cut.Metadata.Width, cut.Metadata.Height)
+	}
+	if cut.Metadata.ImageType != "png" {
+		t.Fatalf("type=%q", cut.Metadata.ImageType)
+	}
+
+	decoded, format, err := image.Decode(bytes.NewReader(cut.Bytes))
+	if err != nil {
+		t.Fatalf("decode cutout: %v", err)
+	}
+	if format != "png" {
+		t.Fatalf("format=%q", format)
+	}
+	if decoded.Bounds().Dx() != 4 || decoded.Bounds().Dy() != 3 {
+		t.Fatalf("decoded dims=%v", decoded.Bounds())
+	}
+
+	// Original in store must be unchanged.
+	orig, err := svc.GetImageData(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetImageData: %v", err)
+	}
+	if !bytes.Equal(orig.Bytes, data) {
+		t.Fatal("cutout mutated stored original")
+	}
+}
+
+// TestGetImageCutoutOutOfBounds: strict in-bounds policy (3+3>5 on a 5x5 image).
+func TestGetImageCutoutOutOfBounds(t *testing.T) {
+	svc := service.NewService(store.NewMemoryStore())
+	ctx := context.Background()
+	created, err := svc.CreateImage(ctx, testPNG(t, 5, 5))
+	if err != nil {
+		t.Fatalf("CreateImage: %v", err)
+	}
+	_, err = svc.GetImageCutout(ctx, created.ID, service.BBox{X: 3, Y: 3, W: 3, H: 3})
+	if !errors.Is(err, service.ErrInvalidBBox) {
+		t.Fatalf("got %v, want ErrInvalidBBox", err)
+	}
+}
+
+// TestGetImageCutoutNotFound checks missing id before crop work matters.
+func TestGetImageCutoutNotFound(t *testing.T) {
+	svc := service.NewService(store.NewMemoryStore())
+	_, err := svc.GetImageCutout(context.Background(), 99, service.BBox{X: 0, Y: 0, W: 1, H: 1})
 	if !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("got %v, want ErrNotFound", err)
 	}
