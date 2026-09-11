@@ -185,3 +185,30 @@ func TestGetImageDataNotFound(t *testing.T) {
 		t.Fatalf("got %v, want ErrNotFound", err)
 	}
 }
+
+func TestGetImageMetadata(t *testing.T) {
+	svc := service.NewService(store.NewMemoryStore())
+	ctx := context.Background()
+	data := testPNG(t, 4, 4)
+
+	created, err := svc.CreateImage(ctx, data)
+	if err != nil {
+		t.Fatalf("CreateImage: %v", err)
+	}
+
+	got, err := svc.GetImageMetadata(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetImageMetadata: %v", err)
+	}
+	if got != created {
+		t.Fatalf("got %+v, want %+v", got, created)
+	}
+}
+
+func TestGetImageMetadataNotFound(t *testing.T) {
+	svc := service.NewService(store.NewMemoryStore())
+	_, err := svc.GetImageMetadata(context.Background(), 99)
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}

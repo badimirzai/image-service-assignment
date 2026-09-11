@@ -280,3 +280,59 @@ func TestGetImageDataInvalidID(t *testing.T) {
 		t.Fatalf("status=%d, want 400", rec.Code)
 	}
 }
+
+func TestGetImageMetadata(t *testing.T) {
+	app := newTestApp(t)
+	data := testPNG(t, 3, 2)
+
+	postReq := httptest.NewRequest(http.MethodPost, "/v1/images", bytes.NewReader(data))
+	postRec := httptest.NewRecorder()
+	app.handler.ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusCreated {
+		t.Fatalf("POST status=%d body=%s", postRec.Code, postRec.Body.String())
+	}
+
+	var created store.Metadata
+	if err := json.NewDecoder(postRec.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v1/images/%d", created.ID), nil)
+	getRec := httptest.NewRecorder()
+	app.handler.ServeHTTP(getRec, getReq)
+
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", getRec.Code, getRec.Body.String())
+	}
+	if ct := getRec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type=%q", ct)
+	}
+
+	var got store.Metadata
+	if err := json.NewDecoder(getRec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got != created {
+		t.Fatalf("got %+v, want %+v", got, created)
+	}
+}
+
+func TestGetImageMetadataNotFound(t *testing.T) {
+	app := newTestApp(t)
+	req := httptest.NewRequest(http.MethodGet, "/v1/images/99", nil)
+	rec := httptest.NewRecorder()
+	app.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404", rec.Code)
+	}
+}
+
+func TestGetImageMetadataInvalidID(t *testing.T) {
+	app := newTestApp(t)
+	req := httptest.NewRequest(http.MethodGet, "/v1/images/abc", nil)
+	rec := httptest.NewRecorder()
+	app.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400", rec.Code)
+	}
+}

@@ -87,6 +87,34 @@ func TestMemoryStoreGetNotFound(t *testing.T) {
 	}
 }
 
+func TestMemoryStoreGetMetadata(t *testing.T) {
+	st := store.NewMemoryStore()
+	ctx := context.Background()
+
+	created, err := st.Create(ctx, store.Metadata{
+		Filesize:  3,
+		Width:     1,
+		Height:    1,
+		ImageType: "png",
+	}, []byte("abc"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	got, err := st.GetMetadata(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetMetadata: %v", err)
+	}
+	if got != created {
+		t.Fatalf("got %+v, want %+v", got, created)
+	}
+
+	_, err = st.GetMetadata(ctx, 99)
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}
+
 func TestMemoryStoreConcurrentCreates(t *testing.T) {
 	st := store.NewMemoryStore()
 	ctx := context.Background()
