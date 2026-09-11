@@ -36,6 +36,9 @@ curl -s http://localhost:8080/v1/images/1
 # Get raw image bytes
 curl -s -o out.png http://localhost:8080/v1/images/1/data
 
+# Cutout (bbox = x,y,w,h; top-left origin)
+curl -s -o crop.png "http://localhost:8080/v1/images/1/data?bbox=10,20,100,80"
+
 # Replace an existing image (PUT; 404 if id missing)
 curl -s -D - -X PUT http://localhost:8080/v1/images/1 --data-binary @path/to/other.jpg
 ```
@@ -110,12 +113,14 @@ HTTP request
 | `GET` | `/v1/images` | 200 | List metadata (newest id first); empty → `[]` |
 | `GET` | `/v1/images/{id}` | 200 / 404 | Metadata for one image |
 | `GET` | `/v1/images/{id}/data` | 200 / 404 | Raw image bytes (`Content-Type` image/*) |
+| `GET` | `/v1/images/{id}/data?bbox=x,y,w,h` | 200 / 400 / 404 | Read-time cutout; storage unchanged |
 | `POST` | `/v1/images` | 201 | Create from raw body → metadata + `Location` |
 | `PUT` | `/v1/images/{id}` | 200 | Replace existing image only (no upsert) |
 | `POST` | `/v1/images/batch` | — | *Not implemented yet* |
-| `GET` | `/v1/images/{id}/data?bbox=` | — | *Not implemented yet* |
 
 **PUT details:** raw image body (same as POST). Re-validates JPEG/PNG/GIF from bytes, replaces stored bytes and derived fields (`filesize`, `width`, `height`, `image_type`). Preserves `id` and original `upload_date`. Missing id → **404**; invalid/unsupported image → **400**; too large → **413**.
+
+**bbox details:** optional query on `/data`. Coordinates are top-left origin, `x,y,w,h` with `w,h > 0`; rectangle must lie fully inside the image (strict, no clipping) → **400** if invalid. Response is re-encoded in the same format (JPEG/PNG/GIF). Animated GIF cutouts use the first frame only (stdlib limitation; documented tradeoff). Originals in the store are never modified.
 
 **Metadata (JSON):** `id`, `filesize`, `width`, `height`, `image_type`, `upload_date` (UTC RFC3339), optional `filename`. Persisted as `ImageRecord{Metadata, Bytes}` (one logical row later in SQLite).
 
@@ -187,10 +192,10 @@ Errors: `{"error":"..."}`. Image responses set `Content-Type` / `Content-Length`
 
 **Implemented (in-memory):**
 - `GET /healthz`
-- `GET /v1/images`, `GET /v1/images/{id}`, `GET /v1/images/{id}/data`
+- `GET /v1/images`, `GET /v1/images/{id}`, `GET /v1/images/{id}/data` (optional `?bbox=`)
 - `POST /v1/images`, `PUT /v1/images/{id}`
 
-**Not yet:** `bbox` cutout, batch upload, SQLite persistence
+**Not yet:** batch upload, SQLite persistence
 
 ---
 
