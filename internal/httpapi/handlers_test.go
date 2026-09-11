@@ -336,3 +336,113 @@ func TestGetImageMetadataInvalidID(t *testing.T) {
 		t.Fatalf("status=%d, want 400", rec.Code)
 	}
 }
+
+func TestUpdateImage(t *testing.T) {
+	app := newTestApp(t)
+	original := testPNG(t, 2, 2)
+	updated := testJPEG(t, 4, 4)
+
+	postReq := httptest.NewRequest(http.MethodPost, "/v1/images", bytes.NewReader(original))
+	postRec := httptest.NewRecorder()
+	app.handler.ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusCreated {
+		t.Fatalf("POST status=%d", postRec.Code)
+	}
+	var created store.Metadata
+	if err := json.NewDecoder(postRec.Body).Decode(&created); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	putReq := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/v1/images/%d", created.ID), bytes.NewReader(updated))
+	putRec := httptest.NewRecorder()
+	app.handler.ServeHTTP(putRec, putReq)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("PUT status=%d body=%s", putRec.Code, putRec.Body.String())
+	}
+
+	var meta store.Metadata
+	if err := json.NewDecoder(putRec.Body).Decode(&meta); err != nil {
+		t.Fatalf("decode put: %v", err)
+	}
+	if meta.ID != created.ID {
+		t.Fatalf("id=%d, want %d", meta.ID, created.ID)
+	}
+	if meta.ImageType != "jpeg" || meta.Width != 4 || meta.Height != 4 {
+		t.Fatalf("unexpected metadata after PUT: %+v", meta)
+	}
+	if meta.UploadDate != created.UploadDate {
+		t.Fatalf("upload_date changed on PUT: got %q want %q", meta.UploadDate, created.UploadDate)
+	}
+	if meta.Filesize != int64(len(updated)) {
+		t.Fatalf("filesize=%d, want %d", meta.Filesize, len(updated))
+	}
+
+	dataReq := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v1/images/%d/data", created.ID), nil)
+	dataRec := httptest.NewRecorder()
+	app.handler.ServeHTTP(dataRec, dataReq)
+	if !bytes.Equal(dataRec.Body.Bytes(), updated) {
+		t.Fatalf("stored bytes were not replaced")
+	}
+}
+
+func TestUpdateImageInvalidFormat(t *testing.T) {
+	app := newTestApp(t)
+	original := testPNG(t, 2, 2)
+
+	postReq := httptest.NewRequest(http.MethodPost, "/v1/images", bytes.NewReader(original))
+	postRec := httptest.NewRecorder()
+	app.handler.ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusCreated {
+		t.Fatalf("POST status=%d", postRec.Code)
+	}
+
+	putReq := httptest.NewRequest(http.MethodPut, "/v1/images/1", bytes.NewReader([]byte("not-an-image")))
+	putRec := httptest.NewRecorder()
+	app.handler.ServeHTTP(putRec, putReq)
+	if putRec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", putRec.Code, putRec.Body.String())
+	}
+	if !bytes.Contains(putRec.Body.Bytes(), []byte("invalid or unsupported image")) {
+		t.Fatalf("expected invalid image error message, got %s", putRec.Body.String())
+	}
+}
+
+func TestUpdateImageNotFound(t *testing.T) {
+	app := newTestApp(t)
+	data := testPNG(t, 2, 2)
+	putReq := httptest.NewRequest(http.MethodPut, "/v1/images/99", bytes.NewReader(data))
+	putRec := httptest.NewRecorder()
+	app.handler.ServeHTTP(putRec, putReq)
+	if putRec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404", putRec.Code)
+	}
+}
+
+func TestUpdateImageTooLarge(t *testing.T) {
+	app := newTestApp(t)
+	original := testPNG(t, 2, 2)
+	postReq := httptest.NewRequest(http.MethodPost, "/v1/images", bytes.NewReader(original))
+	postRec := httptest.NewRecorder()
+	app.handler.ServeHTTP(postRec, postReq)
+	if postRec.Code != http.StatusCreated {
+		t.Fatalf("POST status=%d", postRec.Code)
+	}
+
+	huge := bytes.NewReader(make([]byte, service.MaxImageSize+1))
+	putReq := httptest.NewRequest(http.MethodPut, "/v1/images/1", huge)
+	putRec := httptest.NewRecorder()
+	app.handler.ServeHTTP(putRec, putReq)
+	if putRec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d, want 413", putRec.Code)
+	}
+}
+
+func TestUpdateImageInvalidID(t *testing.T) {
+	app := newTestApp(t)
+	putReq := httptest.NewRequest(http.MethodPut, "/v1/images/abc", bytes.NewReader(testPNG(t, 1, 1)))
+	putRec := httptest.NewRecorder()
+	app.handler.ServeHTTP(putRec, putReq)
+	if putRec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400", putRec.Code)
+	}
+}

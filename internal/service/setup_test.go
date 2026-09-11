@@ -212,3 +212,56 @@ func TestGetImageMetadataNotFound(t *testing.T) {
 		t.Fatalf("got %v, want ErrNotFound", err)
 	}
 }
+
+func TestUpdateImage(t *testing.T) {
+	svc := service.NewService(store.NewMemoryStore())
+	ctx := context.Background()
+	original := testPNG(t, 2, 2)
+	updated := testJPEG(t, 5, 3)
+
+	created, err := svc.CreateImage(ctx, original)
+	if err != nil {
+		t.Fatalf("CreateImage: %v", err)
+	}
+
+	meta, err := svc.UpdateImage(ctx, created.ID, updated)
+	if err != nil {
+		t.Fatalf("UpdateImage: %v", err)
+	}
+	if meta.ImageType != "jpeg" || meta.Width != 5 || meta.Height != 3 {
+		t.Fatalf("unexpected meta: %+v", meta)
+	}
+	if meta.UploadDate != created.UploadDate {
+		t.Fatalf("upload_date should be preserved")
+	}
+
+	rec, err := svc.GetImageData(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetImageData: %v", err)
+	}
+	if !bytes.Equal(rec.Bytes, updated) {
+		t.Fatalf("bytes not updated")
+	}
+}
+
+func TestUpdateImageInvalid(t *testing.T) {
+	svc := service.NewService(store.NewMemoryStore())
+	ctx := context.Background()
+	created, err := svc.CreateImage(ctx, testPNG(t, 2, 2))
+	if err != nil {
+		t.Fatalf("CreateImage: %v", err)
+	}
+
+	_, err = svc.UpdateImage(ctx, created.ID, []byte("nope"))
+	if !errors.Is(err, service.ErrInvalidImage) {
+		t.Fatalf("got %v, want ErrInvalidImage", err)
+	}
+}
+
+func TestUpdateImageNotFound(t *testing.T) {
+	svc := service.NewService(store.NewMemoryStore())
+	_, err := svc.UpdateImage(context.Background(), 99, testPNG(t, 1, 1))
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+}
