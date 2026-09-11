@@ -30,6 +30,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/images", s.handleListImages)
 	mux.HandleFunc("POST /v1/images", s.handleCreateImage)
 	mux.HandleFunc("GET /v1/images/{id}/data", s.handleGetImageData)
+	mux.HandleFunc("GET /v1/images/{id}", s.handleGetImageMetadata)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -68,6 +69,26 @@ func (s *Server) handleGetImageData(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", strconv.Itoa(len(record.Bytes)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(record.Bytes)
+}
+
+// handleGetImageMetadata returns JSON metadata for one image (200).
+func (s *Server) handleGetImageMetadata(w http.ResponseWriter, r *http.Request) {
+	idstr := r.PathValue("id")
+	id, err := strconv.ParseInt(idstr, 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid image ID")
+		return
+	}
+	metadata, err := s.svc.GetImageMetadata(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "image not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	writeJSON(w, http.StatusOK, metadata)
 }
 
 // helper function to get the content type for the image type

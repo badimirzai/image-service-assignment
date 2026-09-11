@@ -40,6 +40,8 @@ type Store interface {
 	Create(ctx context.Context, meta Metadata, data []byte) (Metadata, error)
 	// Get returns one image record (metadata + original bytes) by ID.
 	Get(ctx context.Context, id int64) (ImageRecord, error)
+	// GetMetadata returns metadata for id without copying image bytes.
+	GetMetadata(ctx context.Context, id int64) (Metadata, error)
 	// List returns metadata for all images (no bytes). Empty store → empty slice.
 	List(ctx context.Context) ([]Metadata, error)
 }
@@ -88,6 +90,8 @@ func (s *MemoryStore) Create(ctx context.Context, meta Metadata, data []byte) (M
 }
 
 // Get returns the stored record for id, or ErrNotFound.
+// On error, returns the zero ImageRecord value (Go idiom for non-pointer results;
+// slices may return nil on error — see List).
 func (s *MemoryStore) Get(ctx context.Context, id int64) (ImageRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return ImageRecord{}, err
@@ -106,6 +110,21 @@ func (s *MemoryStore) Get(ctx context.Context, id int64) (ImageRecord, error) {
 	out := rec
 	out.Bytes = cp
 	return out, nil
+}
+
+// GetMetadata returns the stored metadata for id, or ErrNotFound.
+// On error, returns the zero Metadata value (Go idiom for non-pointer results).
+func (s *MemoryStore) GetMetadata(ctx context.Context, id int64) (Metadata, error) {
+	if err := ctx.Err(); err != nil {
+		return Metadata{}, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rec, ok := s.records[id]
+	if !ok {
+		return Metadata{}, ErrNotFound
+	}
+	return rec.Metadata, nil
 }
 
 // List returns metadata for all images, newest (highest ID) first.
