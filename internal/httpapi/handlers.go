@@ -48,7 +48,8 @@ func (s *Server) handleListImages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
-// handleGetImageData returns the raw image bytes for the given ID (not JSON).
+// handleGetImageData returns raw image bytes for id (not JSON).
+// Optional ?bbox=x,y,w,h -> cutout via GetImageCutout (storage unchanged).
 func (s *Server) handleGetImageData(w http.ResponseWriter, r *http.Request) {
 	idstr := r.PathValue("id")
 	id, err := strconv.ParseInt(idstr, 10, 64)
@@ -56,13 +57,31 @@ func (s *Server) handleGetImageData(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid image ID")
 		return
 	}
-	record, err := s.svc.GetImageData(r.Context(), id)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "image not found")
+
+	// Absent or empty bbox -> original bytes path (unchanged behavior).
+	bboxStr := r.URL.Query().Get("bbox")
+
+	var record store.ImageRecord
+	if bboxStr == "" {
+		record, err = s.svc.GetImageData(r.Context(), id)
+	} else {
+		// Syntax / basic numeric checks in service; bounds checked in GetImageCutout.
+		bbox, perr := service.ParseBBox(bboxStr)
+		if perr != nil {
+			writeError(w, http.StatusBadRequest, perr.Error())
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "internal error")
+		record, err = s.svc.GetImageCutout(r.Context(), id, bbox)
+	}
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, "image not found")
+		case errors.Is(err, service.ErrInvalidBBox):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal error")
+		}
 		return
 	}
 
@@ -107,7 +126,7 @@ func contentTypeFor(imageType string) string {
 }
 
 // handleUpdateImage replaces an existing image's bytes and derived metadata (PUT).
-// Does not upsert: missing ID → 404. Body is raw image bytes (same as POST).
+// Does not upsert: missing ID -> 404. Body is raw image bytes (same as POST).
 func (s *Server) handleUpdateImage(w http.ResponseWriter, r *http.Request) {
 	idstr := r.PathValue("id")
 	id, err := strconv.ParseInt(idstr, 10, 64)
