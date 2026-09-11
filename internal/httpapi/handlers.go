@@ -31,6 +31,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/images", s.handleCreateImage)
 	mux.HandleFunc("GET /v1/images/{id}/data", s.handleGetImageData)
 	mux.HandleFunc("GET /v1/images/{id}", s.handleGetImageMetadata)
+	mux.HandleFunc("PUT /v1/images/{id}", s.handleUpdateImage)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -103,6 +104,47 @@ func contentTypeFor(imageType string) string {
 	default:
 		return "application/octet-stream"
 	}
+}
+
+// handleUpdateImage replaces an existing image's bytes and derived metadata (PUT).
+// Does not upsert: missing ID → 404. Body is raw image bytes (same as POST).
+func (s *Server) handleUpdateImage(w http.ResponseWriter, r *http.Request) {
+	idstr := r.PathValue("id")
+	id, err := strconv.ParseInt(idstr, 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid image ID")
+		return
+	}
+
+	// Cap body size at the transport edge using the same limit as the service.
+	r.Body = http.MaxBytesReader(w, r.Body, service.MaxImageSize)
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("image exceeds size limit: %d bytes", maxErr.Limit))
+			return
+		}
+		writeError(w, http.StatusBadRequest, "failed to read body")
+		return
+	}
+
+	metadata, err := s.svc.UpdateImage(r.Context(), id, data)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, "image not found")
+		case errors.Is(err, service.ErrEmptyImage), errors.Is(err, service.ErrInvalidImage):
+			// Unsupported/invalid formats surface here as 400 (same as POST).
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, service.ErrTooLarge):
+			writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, metadata)
 }
 
 // handleCreateImage accepts raw image bytes in the request body

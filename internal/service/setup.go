@@ -106,3 +106,38 @@ func (s *Service) CreateImage(ctx context.Context, data []byte) (store.Metadata,
 
 	return s.store.Create(ctx, meta, data)
 }
+
+// UpdateImage replaces an existing image: validates bytes (JPEG/PNG/GIF), derives
+// new metadata from the payload, and stores the original bytes unchanged.
+// Missing ID → store.ErrNotFound (no upsert). Keeps the original upload_date.
+func (s *Service) UpdateImage(ctx context.Context, id int64, data []byte) (store.Metadata, error) {
+	if len(data) == 0 {
+		return store.Metadata{}, ErrEmptyImage
+	}
+	if len(data) > MaxImageSize {
+		return store.Metadata{}, ErrTooLarge
+	}
+
+	// DecodeConfig reads headers only; format/dimensions come from the payload.
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return store.Metadata{}, fmt.Errorf("%w: %v", ErrInvalidImage, err)
+	}
+	if format != "jpeg" && format != "png" && format != "gif" {
+		return store.Metadata{}, fmt.Errorf("%w: format %q", ErrInvalidImage, format)
+	}
+
+	existing, err := s.store.GetMetadata(ctx, id)
+	if err != nil {
+		return store.Metadata{}, err
+	}
+
+	meta := existing
+	meta.Filesize = int64(len(data))
+	meta.Width = cfg.Width
+	meta.Height = cfg.Height
+	meta.ImageType = format
+	// UploadDate intentionally preserved from the original create.
+
+	return s.store.Update(ctx, id, meta, data)
+}

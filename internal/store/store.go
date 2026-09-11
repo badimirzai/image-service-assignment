@@ -44,6 +44,8 @@ type Store interface {
 	GetMetadata(ctx context.Context, id int64) (Metadata, error)
 	// List returns metadata for all images (no bytes). Empty store → empty slice.
 	List(ctx context.Context) ([]Metadata, error)
+	// Update replaces metadata and bytes for an existing id (no upsert).
+	Update(ctx context.Context, id int64, meta Metadata, data []byte) (Metadata, error)
 }
 
 // MemoryStore is a concurrency-safe in-memory Store.
@@ -83,6 +85,31 @@ func (s *MemoryStore) Create(ctx context.Context, meta Metadata, data []byte) (M
 	copy(cp, data)
 
 	s.records[meta.ID] = ImageRecord{
+		Metadata: meta,
+		Bytes:    cp,
+	}
+	return meta, nil
+}
+
+// Update replaces the image bytes and metadata for an existing id (no upsert).
+// On error, returns the zero Metadata value.
+func (s *MemoryStore) Update(ctx context.Context, id int64, meta Metadata, data []byte) (Metadata, error) {
+	if err := ctx.Err(); err != nil {
+		return Metadata{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.records[id]; !ok {
+		return Metadata{}, ErrNotFound
+	}
+
+	// Copy bytes so the store owns its own slice.
+	cp := make([]byte, len(data))
+	copy(cp, data)
+
+	meta.ID = id
+	s.records[id] = ImageRecord{
 		Metadata: meta,
 		Bytes:    cp,
 	}
