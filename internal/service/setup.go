@@ -8,12 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"image"
-	"image/gif"    // Added: enables gif.Encode
-	_ "image/gif"  // register GIF decoder with image.DecodeConfig
-	"image/jpeg"   // Added: enables jpeg.Encode
-	_ "image/jpeg" // register JPEG decoder
-	"image/png"    // Added: enables png.Encode
-	_ "image/png"  // register PNG decoder
+	"image/gif"
+	"image/jpeg"
+	"image/png"
 	"strconv"
 	"strings"
 	"time"
@@ -132,9 +129,10 @@ func (s *Service) GetImageCutout(ctx context.Context, id int64, bbox BBox) (stor
 		return store.ImageRecord{}, fmt.Errorf("%w: %v", ErrInvalidImage, err)
 	}
 
-	// Strict in bounds: entire rectangle must fit inside the image.
+	// Strict in bounds against decoded pixels (source of truth for the crop).
 	// Image coords: origin top-left, x->right, y->down (all non-negative).
-	width, height := rec.Metadata.Width, rec.Metadata.Height
+	bounds := img.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
 	if bbox.X+bbox.W > width || bbox.Y+bbox.H > height {
 		return store.ImageRecord{}, fmt.Errorf(
 			"%w: rectangle outside image (%dx%d)", ErrInvalidBBox, width, height,
@@ -142,7 +140,13 @@ func (s *Service) GetImageCutout(ctx context.Context, id int64, bbox BBox) (stor
 	}
 
 	// image.Rect is half-open [Min, Max): Max = origin + size.
-	rect := image.Rect(bbox.X, bbox.Y, bbox.X+bbox.W, bbox.Y+bbox.H)
+	// Offset by bounds.Min in case the decoded image is not at (0,0).
+	rect := image.Rect(
+		bounds.Min.X+bbox.X,
+		bounds.Min.Y+bbox.Y,
+		bounds.Min.X+bbox.X+bbox.W,
+		bounds.Min.Y+bbox.Y+bbox.H,
+	)
 
 	// SubImage is the cheap crop (shared backing pixels, new bounds).
 	// Stdlib types from Decode (*YCbCr, *RGBA, *Paletted, …) support it.
