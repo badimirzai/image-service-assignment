@@ -29,11 +29,20 @@ curl -s -D - -X POST http://localhost:8080/v1/images --data-binary @path/to/imag
 
 # List metadata
 curl -s http://localhost:8080/v1/images
+
+# Get metadata by id
+curl -s http://localhost:8080/v1/images/1
+
+# Get raw image bytes
+curl -s -o out.png http://localhost:8080/v1/images/1/data
+
+# Replace an existing image (PUT; 404 if id missing)
+curl -s -D - -X PUT http://localhost:8080/v1/images/1 --data-binary @path/to/other.jpg
 ```
 
 **Example**
 ```bash
-#post data 
+# POST create
 curl -s -D - -X POST http://localhost:8080/v1/images --data-binary @test-images/mario.png
 ```
 
@@ -46,11 +55,10 @@ Content-Length: 110
 
 ```
 
-Verify 
-````bash
-#GET data
+Verify list:
+```bash
 curl -s http://localhost:8080/v1/images
-````
+```
 ```json
 [
   {
@@ -62,10 +70,9 @@ curl -s http://localhost:8080/v1/images
     "upload_date": "2026-09-10T13:44:28Z"
   }
 ]
-
 ```
 
-**Tests** (as they are added):
+**Tests:**
 
 ```bash
 go test ./...
@@ -95,16 +102,20 @@ HTTP request
 
 ---
 
-## API (planned)
+## API
 
-| Method | Path | Behavior |
-|--------|------|----------|
-| `GET` | `/v1/images` | List metadata (all; newest first when implemented) |
-| `GET` | `/v1/images/{id}` | Metadata for one image |
-| `GET` | `/v1/images/{id}/data` | Raw bytes; optional `?bbox=x,y,w,h` cutout |
-| `POST` | `/v1/images` | Create from raw image body → `201` + `Location` + metadata |
-| `PUT` | `/v1/images/{id}` | Replace existing image only (no upsert) |
-| `POST` | `/v1/images/batch` | `multipart/form-data`; bounded concurrency; partial success |
+| Method | Path | Status | Behavior |
+|--------|------|--------|----------|
+| `GET` | `/healthz` | 200 | Liveness |
+| `GET` | `/v1/images` | 200 | List metadata (newest id first); empty → `[]` |
+| `GET` | `/v1/images/{id}` | 200 / 404 | Metadata for one image |
+| `GET` | `/v1/images/{id}/data` | 200 / 404 | Raw image bytes (`Content-Type` image/*) |
+| `POST` | `/v1/images` | 201 | Create from raw body → metadata + `Location` |
+| `PUT` | `/v1/images/{id}` | 200 | Replace existing image only (no upsert) |
+| `POST` | `/v1/images/batch` | — | *Not implemented yet* |
+| `GET` | `/v1/images/{id}/data?bbox=` | — | *Not implemented yet* |
+
+**PUT details:** raw image body (same as POST). Re-validates JPEG/PNG/GIF from bytes, replaces stored bytes and derived fields (`filesize`, `width`, `height`, `image_type`). Preserves `id` and original `upload_date`. Missing id → **404**; invalid/unsupported image → **400**; too large → **413**.
 
 **Metadata (JSON):** `id`, `filesize`, `width`, `height`, `image_type`, `upload_date` (UTC RFC3339), optional `filename`. Persisted as `ImageRecord{Metadata, Bytes}` (one logical row later in SQLite).
 
@@ -174,8 +185,12 @@ Errors: `{"error":"..."}`. Image responses set `Content-Type` / `Content-Length`
 
 ## Current status
 
-- `GET /healthz`, `GET /v1/images`, `POST /v1/images` implemented (in-memory)
-- PUT, get-by-id, `/data`, bbox, and batch not implemented yet
+**Implemented (in-memory):**
+- `GET /healthz`
+- `GET /v1/images`, `GET /v1/images/{id}`, `GET /v1/images/{id}/data`
+- `POST /v1/images`, `PUT /v1/images/{id}`
+
+**Not yet:** `bbox` cutout, batch upload, SQLite persistence
 
 ---
 
