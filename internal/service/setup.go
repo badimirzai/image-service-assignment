@@ -20,7 +20,7 @@ import (
 )
 
 const MaxImageSize = 10 << 20 // 10 MiB limit per image (also enforced at HTTP edge)
-const MaxBatchSize = 12       // max file parts accepted in one batch upload
+const MaxBatchSize = 8       // max file parts accepted in one batch upload
 const BatchWorkers = 4        // fixed worker-pool size for CreateBatch
 
 // Sentinel errors mapped to HTTP status codes by the handler layer.

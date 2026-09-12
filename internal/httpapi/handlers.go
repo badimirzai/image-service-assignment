@@ -242,6 +242,7 @@ func (s *Server) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	items := make([]service.BatchItem, 0, len(files))
+	var partErrors []service.BatchItemError
 	for _, fh := range files {
 		f, err := fh.Open()
 		if err != nil {
@@ -255,9 +256,17 @@ func (s *Server) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "failed to read multipart file")
 			return
 		}
+		name := fh.Filename
+		if name == "" {
+			name = "unnamed"
+		}
+		// Oversized part → per-item error (partial success), not 413 for the whole batch.
 		if int64(len(data)) > service.MaxImageSize {
-			writeError(w, http.StatusRequestEntityTooLarge, service.ErrTooLarge.Error())
-			return
+			partErrors = append(partErrors, service.BatchItemError{
+				Filename: name,
+				Error:    service.ErrTooLarge.Error(),
+			})
+			continue
 		}
 		items = append(items, service.BatchItem{
 			Filename: fh.Filename,
@@ -265,15 +274,23 @@ func (s *Server) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	resp, err := s.svc.CreateBatch(r.Context(), items)
-	if err != nil {
-		switch {
-		case errors.Is(err, service.ErrEmptyBatch), errors.Is(err, service.ErrBatchTooManyImages):
-			writeError(w, http.StatusBadRequest, err.Error())
-		default:
-			writeError(w, http.StatusInternalServerError, "internal error")
+	resp := service.BatchResponse{
+		Success: []store.Metadata{},
+		Errors:  partErrors,
+	}
+	if len(items) > 0 {
+		created, err := s.svc.CreateBatch(r.Context(), items)
+		if err != nil {
+			switch {
+			case errors.Is(err, service.ErrEmptyBatch), errors.Is(err, service.ErrBatchTooManyImages):
+				writeError(w, http.StatusBadRequest, err.Error())
+			default:
+				writeError(w, http.StatusInternalServerError, "internal error")
+			}
+			return
 		}
-		return
+		resp.Success = created.Success
+		resp.Errors = append(resp.Errors, created.Errors...)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
