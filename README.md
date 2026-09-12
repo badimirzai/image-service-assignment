@@ -41,6 +41,11 @@ curl -s -o crop.png "http://localhost:8080/v1/images/1/data?bbox=10,20,100,80"
 
 # Replace an existing image (PUT; 404 if id missing)
 curl -s -D - -X PUT http://localhost:8080/v1/images/1 --data-binary @path/to/other.jpg
+
+# Batch upload (multipart field name: images)
+curl -s -X POST http://localhost:8080/v1/images/batch \
+  -F "images=@path/to/a.png" \
+  -F "images=@path/to/b.jpg"
 ```
 
 **Example**
@@ -116,11 +121,19 @@ HTTP request
 | `GET` | `/v1/images/{id}/data?bbox=x,y,w,h` | 200 / 400 / 404 | Read-time cutout; storage unchanged |
 | `POST` | `/v1/images` | 201 | Create from raw body → metadata + `Location` |
 | `PUT` | `/v1/images/{id}` | 200 | Replace existing image only (no upsert) |
-| `POST` | `/v1/images/batch` | — | *Not implemented yet* |
+| `POST` | `/v1/images/batch` | 200 / 400 / 413 / 415 | Multipart batch; partial success JSON |
 
 **PUT details:** raw image body (same as POST). Re-validates JPEG/PNG/GIF from bytes, replaces stored bytes and derived fields (`filesize`, `width`, `height`, `image_type`). Preserves `id` and original `upload_date`. Missing id → **404**; invalid/unsupported image → **400**; too large → **413**.
 
 **bbox details:** optional query on `/data`. Coordinates are top-left origin, `x,y,w,h` with `w,h > 0`; rectangle must lie fully inside the image (strict, no clipping) → **400** if invalid. Response is re-encoded in the same format (JPEG/PNG/GIF). Animated GIF cutouts use the first frame only (stdlib limitation; documented tradeoff). Originals in the store are never modified.
+
+**Batch details:** `Content-Type: multipart/form-data` with one or more file parts named **`images`** (max **12**). Per-part and request size capped at ~10 MiB per image. Handler parses multipart; service uses a **4-worker** pool and the same validation as single create. Response is always **200** when the batch is accepted:
+
+```json
+{ "success": [ /* metadata... */ ], "errors": [ { "filename": "...", "error": "..." } ] }
+```
+
+Empty batch / too many parts → **400**; whole request body too large → **413**; a single oversized part is a per-item error in the **200** response (other images still processed). Not multipart → **415**. Client disconnect cancels unscheduled work; already-stored images may remain.
 
 **Metadata (JSON):** `id`, `filesize`, `width`, `height`, `image_type`, `upload_date` (UTC RFC3339), optional `filename`. Persisted as `ImageRecord{Metadata, Bytes}` (one logical row later in SQLite).
 
@@ -155,9 +168,9 @@ Locked decisions from the assignment review and clarifying discussions.
 
 - **POST creates; PUT replaces existing only** → missing ID returns **404** (not upsert).
 - **Formats:** JPEG, PNG, GIF.
-- **Limits (initial):** ~10 MiB per image; batch size capped (e.g. 20); fixed worker pool for batch.
+- **Limits (initial):** ~10 MiB per image; batch size capped at 12; 4 workers for batch.
 - **`bbox`:** read-time only - decode stored original, validate coords (top-left, strict in-bounds → 400 if invalid), crop, encode response. Does **not** mutate storage.
-- **Batch:** partial success (`success` + `errors`); fixed-size worker pool; cancel via `r.Context()` on disconnect (stop scheduling / skip further writes). Per-item failures do **not** cancel the batch. Already-stored items before disconnect may remain (no compensating deletes).
+- **Batch:** multipart field `images`; partial success (`success` + `errors`); fixed worker pool; cancel via `r.Context()` on disconnect (stop scheduling / skip further writes). Per-item failures do **not** cancel the batch. Already-stored items before disconnect may remain (no compensating deletes).
 
 ### HTTP status cheat sheet
 
@@ -193,9 +206,9 @@ Errors: `{"error":"..."}`. Image responses set `Content-Type` / `Content-Length`
 **Implemented (in-memory):**
 - `GET /healthz`
 - `GET /v1/images`, `GET /v1/images/{id}`, `GET /v1/images/{id}/data` (optional `?bbox=`)
-- `POST /v1/images`, `PUT /v1/images/{id}`
+- `POST /v1/images`, `PUT /v1/images/{id}`, `POST /v1/images/batch`
 
-**Not yet:** batch upload, SQLite persistence
+**Not yet:** SQLite persistence
 
 ---
 
