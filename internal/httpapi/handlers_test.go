@@ -9,9 +9,11 @@ import (
 	"image/gif"
 	"image/jpeg"
 	"image/png"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/badimirzai/image-service/internal/httpapi"
@@ -549,3 +551,131 @@ func TestGetImageDataBBoxNotFound(t *testing.T) {
 	}
 }
 
+// multipartBody builds a multipart/form-data body with file parts named "images".
+func multipartBody(t *testing.T, files map[string][]byte) (*bytes.Buffer, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	for name, data := range files {
+		part, err := w.CreateFormFile("images", name)
+		if err != nil {
+			t.Fatalf("CreateFormFile: %v", err)
+		}
+		if _, err := part.Write(data); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	return &buf, w.FormDataContentType()
+}
+
+// TestCreateBatch: mixed valid/invalid parts → 200 with partial success.
+func TestCreateBatch(t *testing.T) {
+	app := newTestApp(t)
+	body, ct := multipartBody(t, map[string][]byte{
+		"a.png":   testPNG(t, 2, 2),
+		"bad.bin": []byte("not-an-image"),
+		"b.jpg":   testJPEG(t, 3, 3),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/batch", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	app.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp service.BatchResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Success) != 2 {
+		t.Fatalf("success=%d, want 2; resp=%+v", len(resp.Success), resp)
+	}
+	if len(resp.Errors) != 1 {
+		t.Fatalf("errors=%d, want 1; resp=%+v", len(resp.Errors), resp)
+	}
+}
+
+// TestCreateBatchNotMultipart: wrong Content-Type → 415.
+func TestCreateBatchNotMultipart(t *testing.T) {
+	app := newTestApp(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/batch", bytes.NewReader([]byte("x")))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	app.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status=%d, want 415", rec.Code)
+	}
+}
+
+// TestCreateBatchEmpty: multipart with no "images" parts → 400.
+func TestCreateBatchEmpty(t *testing.T) {
+	app := newTestApp(t)
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	_ = w.WriteField("note", "no files")
+	_ = w.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/batch", &buf)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	rec := httptest.NewRecorder()
+	app.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateBatchTooMany: more than MaxBatchSize parts → 400.
+func TestCreateBatchTooMany(t *testing.T) {
+	app := newTestApp(t)
+	files := make(map[string][]byte, service.MaxBatchSize+1)
+	png := testPNG(t, 1, 1)
+	for i := 0; i < service.MaxBatchSize+1; i++ {
+		files[fmt.Sprintf("%d.png", i)] = png
+	}
+	body, ct := multipartBody(t, files)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/batch", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	app.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateBatchOversizedPart: one part over MaxImageSize is a per-item error; others still succeed (200).
+func TestCreateBatchOversizedPart(t *testing.T) {
+	app := newTestApp(t)
+	body, ct := multipartBody(t, map[string][]byte{
+		"ok.png":   testPNG(t, 2, 2),
+		"huge.bin": make([]byte, service.MaxImageSize+1),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/batch", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	app.handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var resp service.BatchResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Success) != 1 {
+		t.Fatalf("success=%d, want 1; %+v", len(resp.Success), resp)
+	}
+	if len(resp.Errors) != 1 || resp.Errors[0].Filename != "huge.bin" {
+		t.Fatalf("errors=%+v", resp.Errors)
+	}
+	if !strings.Contains(resp.Errors[0].Error, "size limit") {
+		t.Fatalf("expected size-limit error, got %q", resp.Errors[0].Error)
+	}
+}

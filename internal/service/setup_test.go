@@ -370,3 +370,65 @@ func TestGetImageCutoutNotFound(t *testing.T) {
 		t.Fatalf("got %v, want ErrNotFound", err)
 	}
 }
+
+// TestCreateBatchPartialSuccess: valid + invalid items → both success and errors, input order preserved in errors.
+func TestCreateBatchPartialSuccess(t *testing.T) {
+	svc := service.NewService(store.NewMemoryStore())
+	resp, err := svc.CreateBatch(context.Background(), []service.BatchItem{
+		{Filename: "ok.png", Data: testPNG(t, 2, 2)},
+		{Filename: "bad.bin", Data: []byte("nope")},
+		{Filename: "ok2.jpg", Data: testJPEG(t, 2, 2)},
+	})
+	if err != nil {
+		t.Fatalf("CreateBatch: %v", err)
+	}
+	if len(resp.Success) != 2 {
+		t.Fatalf("success=%d, want 2", len(resp.Success))
+	}
+	if len(resp.Errors) != 1 || resp.Errors[0].Filename != "bad.bin" {
+		t.Fatalf("errors=%+v", resp.Errors)
+	}
+}
+
+// TestCreateBatchEmpty rejects an empty item list before starting workers.
+func TestCreateBatchEmpty(t *testing.T) {
+	svc := service.NewService(store.NewMemoryStore())
+	_, err := svc.CreateBatch(context.Background(), nil)
+	if !errors.Is(err, service.ErrEmptyBatch) {
+		t.Fatalf("got %v, want ErrEmptyBatch", err)
+	}
+}
+
+// TestCreateBatchTooMany rejects batches over MaxBatchSize.
+func TestCreateBatchTooMany(t *testing.T) {
+	svc := service.NewService(store.NewMemoryStore())
+	items := make([]service.BatchItem, service.MaxBatchSize+1)
+	for i := range items {
+		items[i] = service.BatchItem{Filename: "x.png", Data: testPNG(t, 1, 1)}
+	}
+	_, err := svc.CreateBatch(context.Background(), items)
+	if !errors.Is(err, service.ErrBatchTooManyImages) {
+		t.Fatalf("got %v, want ErrBatchTooManyImages", err)
+	}
+}
+
+// TestCreateBatchCancel marks unscheduled items as cancelled when ctx is already done.
+func TestCreateBatchCancel(t *testing.T) {
+	svc := service.NewService(store.NewMemoryStore())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	resp, err := svc.CreateBatch(ctx, []service.BatchItem{
+		{Filename: "a.png", Data: testPNG(t, 2, 2)},
+		{Filename: "b.png", Data: testPNG(t, 2, 2)},
+	})
+	if err != nil {
+		t.Fatalf("CreateBatch: %v", err)
+	}
+	if len(resp.Success) != 0 {
+		t.Fatalf("expected no successes after cancel, got %+v", resp.Success)
+	}
+	if len(resp.Errors) != 2 {
+		t.Fatalf("expected 2 errors, got %+v", resp.Errors)
+	}
+}
