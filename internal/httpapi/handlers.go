@@ -8,10 +8,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/badimirzai/image-service/internal/service"
 	"github.com/badimirzai/image-service/internal/store"
-	"strconv"
 )
 
 // Server wires HTTP handlers to the image service.
@@ -32,6 +33,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/images/{id}/data", s.handleGetImageData)
 	mux.HandleFunc("GET /v1/images/{id}", s.handleGetImageMetadata)
 	mux.HandleFunc("PUT /v1/images/{id}", s.handleUpdateImage)
+	mux.HandleFunc("POST /v1/images/batch", s.handleCreateBatch)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -198,6 +200,83 @@ func (s *Server) handleCreateImage(w http.ResponseWriter, r *http.Request) {
 	// 201 Created with Location of the new resource (get-by-id comes later).
 	w.Header().Set("Location", fmt.Sprintf("/v1/images/%d", meta.ID))
 	writeJSON(w, http.StatusCreated, meta)
+}
+
+// handleCreateBatch accepts multipart/form-data with one or more file parts
+// named "images". Parses/limits in the handler; CreateBatch does validation
+// and bounded-concurrent create. Always 200 with partial-success JSON when
+// the batch is accepted for processing.
+func (s *Server) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
+	ct := r.Header.Get("Content-Type")
+	if ct == "" || !strings.HasPrefix(ct, "multipart/form-data") {
+		writeError(w, http.StatusUnsupportedMediaType, "expected multipart/form-data")
+		return
+	}
+
+	// Cap the whole request roughly to max batch * max image size.
+	maxBody := int64(service.MaxBatchSize) * service.MaxImageSize
+	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+
+	// Keep some parts in memory; larger spill to temp files.
+	const maxMemory = 32 << 20 // 32 MiB
+	if err := r.ParseMultipartForm(maxMemory); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds size limit")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "failed to parse multipart form")
+		return
+	}
+	defer r.MultipartForm.RemoveAll()
+
+	files := r.MultipartForm.File["images"]
+	if len(files) == 0 {
+		writeError(w, http.StatusBadRequest, service.ErrEmptyBatch.Error())
+		return
+	}
+	if len(files) > service.MaxBatchSize {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("%s: limit is %d", service.ErrBatchTooManyImages.Error(), service.MaxBatchSize))
+		return
+	}
+
+	items := make([]service.BatchItem, 0, len(files))
+	for _, fh := range files {
+		f, err := fh.Open()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "failed to read multipart file")
+			return
+		}
+		// Read at most MaxImageSize+1 to detect oversized parts without trusting fh.Size.
+		data, err := io.ReadAll(io.LimitReader(f, service.MaxImageSize+1))
+		_ = f.Close()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "failed to read multipart file")
+			return
+		}
+		if int64(len(data)) > service.MaxImageSize {
+			writeError(w, http.StatusRequestEntityTooLarge, service.ErrTooLarge.Error())
+			return
+		}
+		items = append(items, service.BatchItem{
+			Filename: fh.Filename,
+			Data:     data,
+		})
+	}
+
+	resp, err := s.svc.CreateBatch(r.Context(), items)
+	if err != nil {
+		switch {
+		case errors.Is(err, service.ErrEmptyBatch), errors.Is(err, service.ErrBatchTooManyImages):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {

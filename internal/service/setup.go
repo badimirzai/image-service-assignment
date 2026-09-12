@@ -13,20 +13,24 @@ import (
 	"image/png"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/badimirzai/image-service/internal/store"
 )
 
 const MaxImageSize = 10 << 20 // 10 MiB limit per image (also enforced at HTTP edge)
-const MaxBatchSize = 20       // reserved for batch upload (not wired yet)
+const MaxBatchSize = 12       // max file parts accepted in one batch upload
+const BatchWorkers = 4        // fixed worker-pool size for CreateBatch
 
 // Sentinel errors mapped to HTTP status codes by the handler layer.
 var (
-	ErrEmptyImage   = errors.New("empty image body")
-	ErrInvalidImage = errors.New("invalid or unsupported image")
-	ErrTooLarge     = errors.New("image exceeds size limit")
-	ErrInvalidBBox  = errors.New("invalid bbox") // handler maps this to 400
+	ErrEmptyImage         = errors.New("empty image body")
+	ErrInvalidImage       = errors.New("invalid or unsupported image")
+	ErrTooLarge           = errors.New("image exceeds size limit")
+	ErrInvalidBBox        = errors.New("invalid bbox") // handler maps this to 400
+	ErrEmptyBatch         = errors.New("batch contains no images")
+	ErrBatchTooManyImages = errors.New("batch contains too many images")
 )
 
 // BBox is a cutout rectangle in image pixel coordinates.
@@ -34,6 +38,18 @@ var (
 // W/H are width/height (not bottom-right corner).
 type BBox struct {
 	X, Y, W, H int
+}
+
+// BatchItem represents a single image in a batch upload.
+type BatchItem struct {
+	Filename string // original filename from the multipart form
+	Data     []byte // raw image bytes from the form field
+}
+
+// BatchResponse is the partial-success shape for batch uploads.
+type BatchResponse struct {
+	Success []store.Metadata `json:"success"` // metadata for successfully uploaded images
+	Errors  []BatchItemError `json:"errors"`  // errors for failed uploads (input order)
 }
 
 // ParseBBox parses "x,y,w,h" into a BBox.
@@ -71,12 +87,6 @@ func ParseBBox(s string) (BBox, error) {
 type BatchItemError struct {
 	Filename string `json:"filename"`
 	Error    string `json:"error"`
-}
-
-// BatchResponse is the partial-success shape for batch uploads (not wired yet).
-type BatchResponse struct {
-	Success []store.Metadata `json:"success"`
-	Errors  []BatchItemError `json:"errors"`
 }
 
 // Service holds application logic and depends on the Store interface only.
@@ -195,10 +205,9 @@ func (s *Service) GetImageMetadata(ctx context.Context, id int64) (store.Metadat
 	return s.store.GetMetadata(ctx, id)
 }
 
-// CreateImage validates that data is a supported image, derives metadata from
-// the bytes themselves (not from Content-Type), and stores the original payload
-// unchanged. Supported formats: JPEG, PNG, GIF.
-func (s *Service) CreateImage(ctx context.Context, data []byte) (store.Metadata, error) {
+// CreateFromBytes validates JPEG/PNG/GIF, builds metadata, stores original bytes.
+// filename is empty for raw-body POST; set for multipart batch parts.
+func (s *Service) CreateFromBytes(ctx context.Context, data []byte, filename string) (store.Metadata, error) {
 	if len(data) == 0 {
 		return store.Metadata{}, ErrEmptyImage
 	}
@@ -215,16 +224,134 @@ func (s *Service) CreateImage(ctx context.Context, data []byte) (store.Metadata,
 		return store.Metadata{}, fmt.Errorf("%w: format %q", ErrInvalidImage, format)
 	}
 
+	// Skip the store write if the client already disconnected (batch cancel).
+	if err := ctx.Err(); err != nil {
+		return store.Metadata{}, err
+	}
+
 	meta := store.Metadata{
 		Filesize:   int64(len(data)),
 		Width:      cfg.Width,
 		Height:     cfg.Height,
 		ImageType:  format,
 		UploadDate: time.Now().UTC().Format(time.RFC3339),
-		// Filename left empty for raw-body uploads; batch may set it later.
+		Filename:   filename,
 	}
 
 	return s.store.Create(ctx, meta, data)
+}
+
+// CreateImage validates that data is a supported image, derives metadata from
+// the bytes themselves (not from Content-Type), and stores the original payload
+// unchanged. Supported formats: JPEG, PNG, GIF.
+func (s *Service) CreateImage(ctx context.Context, data []byte) (store.Metadata, error) {
+	return s.CreateFromBytes(ctx, data, "")
+}
+
+// CreateBatch processes items concurrently with a fixed worker pool.
+// Returns partial success (success + errors) in input order. Only workers write
+// per-item results; on cancel, unscheduled items are marked cancelled after the
+// pool drains (avoids duplicate/racy writes to the results channel).
+func (s *Service) CreateBatch(ctx context.Context, items []BatchItem) (BatchResponse, error) {
+	if len(items) == 0 {
+		return BatchResponse{}, ErrEmptyBatch
+	}
+	if len(items) > MaxBatchSize {
+		return BatchResponse{}, fmt.Errorf("%w: batch size exceeds limit of %d", ErrBatchTooManyImages, MaxBatchSize)
+	}
+
+	type result struct {
+		idx  int
+		meta store.Metadata
+		err  error
+	}
+
+	jobs := make(chan int)
+	results := make(chan result, len(items))
+
+	workers := BatchWorkers
+	if workers > len(items) {
+		workers = len(items)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				if err := ctx.Err(); err != nil {
+					results <- result{idx: idx, err: err}
+					continue
+				}
+				item := items[idx]
+				meta, err := s.CreateFromBytes(ctx, item.Data, item.Filename)
+				results <- result{idx: idx, meta: meta, err: err}
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Feed jobs; on cancel stop scheduling (close jobs) so workers exit.
+	go func() {
+		defer close(jobs)
+		for i := range items {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- i:
+			}
+		}
+	}()
+
+	metas := make([]store.Metadata, len(items))
+	itemErrs := make([]error, len(items))
+	received := make([]bool, len(items))
+	for r := range results {
+		received[r.idx] = true
+		if r.err != nil {
+			itemErrs[r.idx] = r.err
+		} else {
+			metas[r.idx] = r.meta
+		}
+	}
+
+	// Indices never scheduled after cancel never got a worker result.
+	cancelErr := ctx.Err()
+	for i := range items {
+		if !received[i] {
+			if cancelErr != nil {
+				itemErrs[i] = cancelErr
+			} else {
+				itemErrs[i] = errors.New("batch item was not processed")
+			}
+		}
+	}
+
+	response := BatchResponse{
+		Success: make([]store.Metadata, 0, len(items)),
+		Errors:  make([]BatchItemError, 0),
+	}
+	for i := range items {
+		name := items[i].Filename
+		if name == "" {
+			name = fmt.Sprintf("index-%d", i)
+		}
+		if itemErrs[i] != nil {
+			response.Errors = append(response.Errors, BatchItemError{
+				Filename: name,
+				Error:    itemErrs[i].Error(),
+			})
+			continue
+		}
+		response.Success = append(response.Success, metas[i])
+	}
+
+	return response, nil
 }
 
 // UpdateImage replaces an existing image: validates bytes (JPEG/PNG/GIF), derives
