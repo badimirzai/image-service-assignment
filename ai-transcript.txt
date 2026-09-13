@@ -1,0 +1,1854 @@
+# Go HTTP service assignment
+_Exported on 13/09/2026 at 22:38:47 CEST from Cursor (3.19.19)_
+
+---
+
+**User**
+
+Act as a senior/principal backend engineer reviewing the assignment in assignment-instructions.md.
+
+Do NOT write or modify any code yet. Do NOT create files.
+
+Your job in this first step is to help me understand the problem, make explicit engineering decisions, and establish a pragmatic implementation plan that I can implement myself.
+
+The goal is a small production-quality Go HTTP service that fully satisfies the assignment while remaining easy for an evaluator to clone, test, and run.
+
+The ideal developer experience is:
+
+git clone ...
+go test ./...
+go run ./cmd/server
+
+and the service should immediately be usable without requiring external infrastructure.
+
+1. Requirements analysis
+
+Analyze assignment-instructions.md and produce:
+
+1. Functional requirements
+2. HTTP/API requirements
+3. Data/model requirements
+4. Validation and security requirements
+5. Concurrency requirements
+6. Cancellation requirements
+7. Error-handling requirements
+8. Performance/scalability requirements
+9. Testing requirements
+10. Operational/deployment requirements
+11. Ambiguities in the specification
+12. Reasonable assumptions I should explicitly document
+
+For every ambiguity:
+
+* Explain the possible interpretations
+* Recommend one
+* Explain why it is the best choice for this assignment
+
+2. Proposed implementation strategy
+
+I want to develop this incrementally.
+
+Initial implementation:
+
+* In-memory storage
+* No external database
+* Easy to test
+* Clear repository/storage boundary
+
+Later, if time permits:
+
+* Replace the in-memory implementation with SQLite
+* Store the actual uploaded image bytes as a SQLite BLOB
+* Store validated metadata alongside the BLOB
+* Keep the rest of the application independent of SQLite
+
+Explain how you would structure this transition without creating unnecessary abstractions.
+
+The architecture should allow:
+
+HTTP handlers
+    ↓
+application/service logic
+    ↓
+storage interface
+    ↓
+in-memory implementation
+    ↓
+later: SQLite implementation
+
+Challenge this structure if you think there is a better, simpler approach.
+
+3. Trust boundaries and validation
+
+I do not want to blindly trust client-provided information.
+
+Identify exactly:
+
+* What information comes from the request
+* What must be validated
+* What metadata should be derived from the actual image bytes
+* What malformed inputs must be rejected
+* How image type/format and dimensions should be determined
+* How request/image size limits should work
+* Which HTTP status code each class of failure should produce
+
+Prefer using Go’s standard library where practical.
+
+4. HTTP semantics
+
+Evaluate the appropriate use of:
+
+* 200 OK
+* 201 Created
+* 400 Bad Request
+* 404 Not Found
+* 413 Content Too Large
+* 415 Unsupported Media Type
+* 500 Internal Server Error
+
+Also identify:
+
+* Required response headers
+* Content-Type
+* Content-Length
+* Location where appropriate
+* JSON error format
+* Any other HTTP semantics that materially improve correctness
+
+Do not invent requirements that are not useful for this assignment.
+
+5. Architecture options
+
+Propose 2-3 reasonable architectures, from simplest to more production-oriented.
+
+For each, explain:
+
+* Components
+* Data flow
+* Complexity
+* Testability
+* Scalability
+* Main tradeoffs
+* What could go wrong
+
+Then recommend one.
+
+The solution should be appropriately engineered, not over-engineered.
+
+6. Development plan
+
+Give me a staged implementation plan using small, meaningful Git commits.
+
+For example:
+
+Foundation
+→ In-memory vertical slice
+→ Image validation
+→ Remaining API
+→ SQLite persistence
+→ Batch/concurrency
+→ Testing
+→ Hardening
+→ Final review
+
+For each stage explain:
+
+* What I should implement
+* What should be tested
+* What architectural decision is being demonstrated
+* A suggested commit message
+
+Every stage should leave the project in a runnable/testable state.
+
+7. Important constraint
+
+I will write the implementation myself.
+
+Therefore:
+
+* Do not generate implementation code
+* Do not give me large code snippets
+* Do not prematurely solve implementation details
+* Focus on reasoning, tradeoffs, interfaces, failure modes, and design decisions
+
+I will ask for implementation guidance separately when needed.
+
+Finally, give me a concise “Recommended starting point” containing:
+
+1. Architecture
+2. Core interfaces/components
+3. Initial data model
+4. First Git commit
+5. First implementation milestone
+6. The most important engineering risks to keep in mind
+
+Be skeptical and pragmatic. Optimize for a solution that an experienced backend engineer would be comfortable reviewing and merging, while keeping the scope appropriate for a take-home assignment.
+
+---
+
+**Cursor**
+
+I'll analyze the assignment instructions and produce a requirements-driven design plan—no code or files.
+
+# Assignment Design Review
+
+The brief is a small image CRUD + batch API with validation, correct HTTP semantics, bounded concurrent uploads, and cancellation on client disconnect. Scope is deliberately limited; motivated tradeoffs are expected.
+
+---
+
+## 1. Requirements analysis
+
+### 1. Functional requirements
+
+| # | Requirement |
+|---|-------------|
+| F1 | Store uploaded image bytes and associated metadata |
+| F2 | List all stored images’ metadata |
+| F3 | Fetch metadata for one image by ID |
+| F4 | Fetch raw image bytes by ID |
+| F5 | Optionally return a rectangular cutout via `?bbox=x,y,w,h` |
+| F6 | Create a new image via `POST /v1/images` (body = image data) |
+| F7 | Replace an existing image via `PUT /v1/images/<id>` |
+| F8 | Batch-upload multiple images via `POST /v1/images/batch` (`multipart/form-data`) |
+| F9 | Batch processing with bounded parallelism |
+| F10 | Cancel in-flight batch work if the client disconnects |
+| F11 | Return per-item success metadata and per-item failures for batch |
+
+### 2. HTTP/API requirements
+
+- Versioned under `/v1`
+- Six endpoints as listed
+- Proper status codes and headers (`Content-Type`, etc.)
+- Metadata representation is yours to choose (JSON is the obvious choice)
+- `POST`/`PUT` body = image bytes (not a JSON wrapper with a URL)
+- Batch uses multipart; response must report successes and failures
+
+### 3. Data/model requirements
+
+**Required metadata fields:**
+- Filesize
+- Dimensions (width, height)
+- Image type (gif, jpg, etc.)
+- Upload date/time
+- Extra fields of your choice (ID is effectively required; others optional)
+
+**Implied stored data:**
+- Stable ID
+- Raw (or cropped-on-read) image bytes
+- Derived metadata above
+
+### 4. Validation and security requirements
+
+Explicit: “proper data validation.” Implied for production-quality:
+
+- Reject non-images / unsupported formats
+- Bound request body size
+- Validate `bbox` (parse, non-negative, within image bounds or clear clip policy)
+- Do not trust client `Content-Type` alone
+- Safe decoding (avoid decompression bombs via size limits + decode limits)
+
+### 5. Concurrency requirements
+
+- Batch: process images concurrently with **bounded** parallelism
+- Single-image endpoints: concurrent-safe storage (reads/writes under concurrency)
+- List/get must not race with create/update
+
+### 6. Cancellation requirements
+
+- Explicit only for batch: if client disconnects mid-request, cancel in-flight processing
+- Practically: propagate `r.Context()` through service → workers → storage ops that can respect it
+
+### 7. Error-handling requirements
+
+- Correct HTTP status codes
+- Batch: partial success (some OK, some errors) — not all-or-nothing
+- Failures should be actionable (which part failed, why) without leaking internals
+
+### 8. Performance/scalability requirements
+
+- “Performant and ideally easily scalable”
+- Motivated less-ideal choices are OK
+- Bounded parallelism is the only hard concurrency knob
+- In-memory or SQLite is fine if you document the scaling path (object store + metadata DB, etc.)
+
+### 9. Testing requirements
+
+- Not spelled out, but “merge to main” implies:
+  - Unit tests for validation, bbox, storage
+  - Handler/API tests via `httptest`
+  - Concurrent/batch + cancellation tests
+  - `go test ./...` with no external deps for the default path
+
+### 10. Operational/deployment requirements
+
+- Deliver as git bundle with a nice commit history
+- Deploy somewhere optional
+- If AI tools used: include `ai-transcript.txt`
+- DX target you set: clone → test → run with no infra
+
+### 11. Ambiguities (with recommendations)
+
+| Ambiguity | Interpretations | Recommendation | Why |
+|-----------|-----------------|----------------|-----|
+| **Image formats** | Any format vs JPEG/PNG/GIF only | Support **JPEG, PNG, GIF** via stdlib `image` + format imports | Matches “gif, jpg, etc.”, no extra deps, enough for the assignment |
+| **POST Content-Type** | Require `image/*` vs sniff bytes vs either | **Sniff/decode bytes**; treat missing/wrong Content-Type as soft signal, reject if decode fails | Clients often lie; bytes are the source of truth |
+| **ID generation** | Client-supplied vs server UUID/ULID | **Server-generated UUID** (or similar) | PUT is update-by-id; create shouldn’t require client IDs |
+| **PUT semantics** | Full replace vs upsert | **Full replace of existing only → 404 if missing** | Clearer than upsert; matches “Update image” |
+| **List pagination** | All vs paginated | **Return all** (document limit); optional `?limit` later | Spec doesn’t ask for pagination; keep small |
+| **List order** | Unspecified | **Newest first** by upload time | Predictable for evaluators |
+| **bbox out of bounds** | 400 vs clip | **400 if invalid/out of bounds** | Stricter, easier to test; no silent clipping surprises |
+| **bbox coordinate system** | Origin top-left vs bottom-left | **Top-left, x right, y down** (image coords) | Universal for 2D image APIs |
+| **Cropped response Content-Type** | Always original vs encode as PNG | **Same format as stored** when encoder exists; otherwise **PNG** | Prefer fidelity; document fallback |
+| **Batch response shape** | Array of results vs `{created, errors}` | **`{images: [...], errors: [{index/name, error}]}`** | Clear partial success |
+| **Batch field name** | Any file parts vs fixed `images` | Accept **all file parts**; ignore non-file fields | Flexible multipart |
+| **Max body / image size** | Unspecified | **e.g. 10 MiB per image**, enforce with `http.MaxBytesReader` | Prevents DoS; document in README |
+| **Max batch size** | Unspecified | Cap **e.g. 20 images** and/or total multipart size | Bounded work |
+| **Parallelism bound** | Unspecified | Default **e.g. 4**, env-configurable | Demonstrates bounded concurrency without tuning theater |
+| **Extra metadata fields** | Anything | `id`, `created_at` (required-ish), maybe `updated_at` on PUT | Minimal and useful |
+| **Timezone** | Local vs UTC | **RFC3339 UTC** | Standard for APIs |
+| **DELETE** | Not mentioned | **Don’t implement** | Out of scope |
+| **Auth** | Not mentioned | **None** | Out of scope; note in README |
+| **Idempotency of POST** | New each time vs content-hash | **Always new ID** | Simpler; PUT handles replace |
+| **Empty list** | 200 `[]` vs 204 | **200 with `[]`** | Easier clients |
+| **GET data without bbox** | Stream stored bytes | Exact stored bytes + correct Content-Type | No re-encode |
+| **Storage durability** | Ephemeral OK? | In-memory OK for v1; SQLite if time | Matches your DX goal |
+
+### 12. Assumptions to document (README)
+
+1. Supported formats: JPEG, PNG, GIF only  
+2. Metadata derived from decoded image, not client headers  
+3. Max image size / max batch count / worker limit  
+4. PUT = replace existing; 404 if ID missing  
+5. No auth; local/demo deployment  
+6. In-memory (then optional SQLite): data lost on restart for memory  
+7. Scaling note: next step would be object storage + metadata DB + CDN  
+8. AI usage → `ai-transcript.txt` if required by submission rules  
+
+---
+
+## 2. Proposed implementation strategy
+
+### Your layered shape is good — keep it thin
+
+```
+handlers  →  service  →  storage interface  →  memory / later sqlite
+```
+
+**Challenge / simplification:** For this assignment size, avoid a heavy “domain layer,” DTOs everywhere, or repository + unit-of-work. Prefer:
+
+- **`internal/httpapi`** (or `handlers`): parse HTTP, status mapping, headers  
+- **`internal/images`**: create/update/get/list/crop/batch orchestration, validation, concurrency  
+- **`internal/store`**: interface + memory (+ optional sqlite)
+
+The service owns: decode/validate image, derive metadata, bbox crop, batch worker pool + ctx cancel.  
+Storage owns: durable/ephemeral persistence of `{id → bytes + metadata}` only.
+
+**Do not abstract:**
+- Image decoding behind a plugin system  
+- “Repository” separate from “Store”  
+- Event bus / CQRS  
+- Generic multipart framework  
+
+**SQLite transition without ceremony:**
+
+1. Define a small store interface early, e.g. conceptually:  
+   `Create`, `Update`, `Get`, `GetData`, `List`  
+   (signatures take `context.Context`; return typed errors like `ErrNotFound`)
+2. Memory impl: `sync.RWMutex` + map  
+3. Later SQLite: same interface; one table with `id`, metadata columns, `blob`; transactions per write  
+4. Wire in `main` via constructor — **no factory registry**  
+5. Handlers/tests stay on the interface; add a few SQLite integration tests if you add it  
+
+**When the interface is unnecessary:** If you truly only ever ship memory, you could skip the interface and still pass. Given you want a possible SQLite swap, a **4–6 method interface** is the right amount of abstraction—not over-engineering.
+
+**Better simpler alternative?** Single package with handlers calling a `MemoryStore` directly is fine for a tiny demo, but you already want the swap path and clear tests. The thin interface wins.
+
+**Blob in SQLite:** Fine for assignment scale. Document that production would use S3/GCS + DB metadata. Don’t build that now.
+
+---
+
+## 3. Trust boundaries and validation
+
+### What comes from the request
+
+| Source | Trust? |
+|--------|--------|
+| Raw body bytes (`POST`/`PUT`) | Untrusted; decode + size-limit |
+| `Content-Type` header | Untrusted hint only |
+| Path `id` | Untrusted; validate format (UUID); lookup |
+| `bbox` query | Untrusted; parse + bounds-check |
+| Multipart parts (filename, part Content-Type, bytes) | Filename only for error reporting; type from bytes |
+
+### Must validate
+
+- Body non-empty and within max size  
+- Bytes decode as supported image  
+- `id` well-formed and exists where required  
+- `bbox`: 4 ints, `w>0`, `h>0`, region ⊆ image  
+- Batch: part count ≤ max; each part same per-image rules  
+- Multipart Content-Type for batch endpoint  
+
+### Derive from bytes (not client)
+
+- Format (`jpeg`/`png`/`gif`) via decode config / format sniff  
+- Width, height from decoded bounds  
+- Filesize = `len(storedBytes)` (original upload bytes, not re-encoded)  
+- `created_at` / `updated_at` = server clock  
+
+**Prefer:** `http.MaxBytesReader` → read → `image.Decode` / `DecodeConfig` with format blank-imports. `DecodeConfig` can get dimensions + format without full decode for metadata-only paths; for store-and-serve you still need the original bytes. Validate with decode (or DecodeConfig + verify); store **original bytes**, not re-encoded, so GET data is bit-stable.
+
+### Reject as malformed
+
+- Empty body  
+- Oversized body  
+- Undecodable / unsupported format  
+- Invalid UUID / unknown ID (different statuses)  
+- Malformed or OOB bbox  
+- Batch not multipart / too many parts / empty batch (decide: empty batch → 400)
+
+### Size limits
+
+- Wrap body with `MaxBytesReader` at handler edge  
+- Optionally also check `Content-Length` early (still enforce on read—clients lie)  
+- Batch: limit total request size and/or per-part size  
+
+### Status mapping (classes)
+
+| Failure | Status |
+|---------|--------|
+| Bad JSON/query/bbox parse, empty body, invalid image, unsupported format, empty batch | **400** (or **415** for clearly wrong media type on batch/non-image—see §4) |
+| Unknown ID | **404** |
+| Body too large | **413** |
+| Wrong Content-Type for batch (not multipart) | **415** |
+| Unexpected store/panic-level failure | **500** |
+| Success GET/list | **200** |
+| Success POST create | **201** |
+| Success PUT | **200** (or 204 with no body—prefer **200 + metadata** for symmetry) |
+
+---
+
+## 4. HTTP semantics
+
+| Code | Use when |
+|------|----------|
+| **200** | List; get metadata; get image data; successful PUT; batch completed (including partial success) |
+| **201** | Single image created (`POST /v1/images`) |
+| **400** | Validation errors (bbox, empty, undecodable image, bad id format if you don’t use 404 for that) |
+| **404** | ID not found |
+| **413** | Exceeds max bytes |
+| **415** | `POST /batch` without `multipart/form-data`; optionally single upload with clearly non-image Content-Type *before* reading—bytes still win if you sniff; don’t overuse 415 |
+| **500** | Bugs / unexpected storage errors only |
+
+**Practical 415 vs 400:**  
+- Unsupported *image format* after sniff → **400** (body was understood as “try to upload image,” content invalid)  
+- Endpoint expects multipart, got `application/json` → **415**  
+
+### Headers
+
+| Response | Headers |
+|----------|---------|
+| Metadata JSON | `Content-Type: application/json` |
+| Image bytes | `Content-Type: image/jpeg\|png\|gif`, `Content-Length` |
+| Create | `Location: /v1/images/<id>` + JSON body with metadata |
+| Errors | `Content-Type: application/json` |
+
+### Error JSON (keep minimal)
+
+```json
+{"error":"image too large"}
+```
+
+Batch:
+
+```json
+{
+  "images": [ /* metadata objects */ ],
+  "errors": [ { "name": "a.png", "error": "unsupported format" } ]
+}
+```
+
+Even when some fail, **200** with both arrays is the right partial-success pattern (not 207 unless you want WebDAV theater—skip 207).
+
+### Other useful semantics
+
+- Don’t set entity tags / caching unless you want a small `ETag` from content hash—optional, not required  
+- Propagate context cancellation on batch  
+- No redirect tricks  
+
+---
+
+## 5. Architecture options
+
+### Option A — Minimal monolith (simplest)
+
+**Components:** `main` + one `handlers.go` + `store.go` (memory map)  
+**Flow:** Handler validates → writes map → responds  
+**Complexity:** Lowest  
+**Testability:** Good with `httptest`  
+**Scalability:** Process-local only  
+**Tradeoffs:** Batch/crop logic tangled in handlers; SQLite swap messier  
+**Failure modes:** Fat handlers; hard to test cancel/concurrency in isolation  
+
+### Option B — Thin service + store interface (recommended)
+
+**Components:** `cmd/server`, `httpapi`, `images` (service), `store` (interface + memory [+ sqlite])  
+**Flow:** HTTP → service (validate, decode, crop, batch) → store  
+**Complexity:** Low–moderate; clear seams  
+**Testability:** Service tests without HTTP; store tests without HTTP; handler tests thin  
+**Scalability:** Same process limits; documented upgrade path  
+**Tradeoffs:** Tiny bit more wiring  
+**Failure modes:** Over-abstracting the interface (resist)  
+
+### Option C — “Production-oriented”
+
+**Components:** B + config package, middleware metrics/logging, migrations, object storage interface, OpenAPI, graceful shutdown orchestration  
+**Complexity:** High for a take-home  
+**Testability:** Excellent but slow to build  
+**Scalability:** Better story on paper  
+**Tradeoffs:** Looks padded; more to break  
+**Failure modes:** Incomplete glue, evaluator fatigue  
+
+### Recommendation: **Option B**
+
+It shows production judgment (boundaries, testability, cancel/concurrency in the service) without resume-driven architecture. Document how you’d scale (blob store, metadata DB, horizontal API) in the README—that satisfies the brief’s “motivated less ideal choice” clause.
+
+---
+
+## 6. Development plan (commit-staged)
+
+Every stage: `go test ./...` green; server runnable when applicable.
+
+### Stage 0 — Foundation
+- **Implement:** module layout (`cmd/server`, `internal/...`), README run instructions, health or empty mux with `/v1` stub, `.gitignore`  
+- **Test:** module builds  
+- **Decision:** package layout, no external infra  
+- **Commit:** `chore: scaffold Go module and server entrypoint`
+
+### Stage 1 — In-memory vertical slice
+- **Implement:** store interface + memory; `POST` + `GET` metadata + `GET` data (no validation beyond non-empty); wire server  
+- **Test:** create → get metadata → get bytes roundtrip  
+- **Decision:** storage boundary; server-generated IDs; metadata JSON shape  
+- **Commit:** `feat: add in-memory image store and create/get endpoints`
+
+### Stage 2 — Image validation & derived metadata
+- **Implement:** max bytes, decode JPEG/PNG/GIF, derive type/dimensions/filesize/timestamps; reject bad bodies  
+- **Test:** valid formats; garbage bytes → 400; oversized → 413  
+- **Decision:** bytes as source of truth; stdlib-only decode  
+- **Commit:** `feat: validate uploads and derive image metadata from bytes`
+
+### Stage 3 — Remaining single-image API
+- **Implement:** list, PUT replace, 404 paths, `Location` on create  
+- **Test:** list order; PUT success/404; headers  
+- **Decision:** PUT not upsert; list ordering  
+- **Commit:** `feat: add list and update image endpoints`
+
+### Stage 4 — BBox cutout
+- **Implement:** parse `bbox`, crop, encode response  
+- **Test:** valid crop; OOB/malformed → 400; Content-Type  
+- **Decision:** top-left coords; strict bounds; encode policy  
+- **Commit:** `feat: support bbox cutout on image data endpoint`
+
+### Stage 5 — Batch + concurrency + cancel
+- **Implement:** multipart parse; worker pool; per-item errors; `ctx` cancel on disconnect  
+- **Test:** mixed success/fail; parallelism bound (optional semaphore assertion); cancelled context stops work  
+- **Decision:** partial success response; bounded parallelism  
+- **Commit:** `feat: add concurrent batch upload with cancellation`
+
+### Stage 6 — SQLite (optional, time permitting)
+- **Implement:** SQLite store; BLOB + columns; select via main/flag/env  
+- **Test:** same store contract tests against SQLite (temp file/`file::memory:`)  
+- **Decision:** app independent of engine via interface  
+- **Commit:** `feat: add SQLite store implementation behind existing store interface`
+
+### Stage 7 — Hardening & DX
+- **Implement:** timeouts on server, structured errors consistency, README assumptions/limits, example `curl`s  
+- **Test:** a few end-to-end handler tests if gaps remain  
+- **Decision:** production-ish defaults without infra  
+- **Commit:** `chore: harden server defaults and document API assumptions`
+
+### Stage 8 — Final review
+- **Implement:** nothing major; fix naming, ensure bundle-friendly history, add `ai-transcript.txt` if needed  
+- **Test:** full suite  
+- **Decision:** merge-ready polish  
+- **Commit:** `docs: finalize README and submission notes`  
+
+(Adjust: if SQLite slips, skip Stage 6; memory + scaling paragraph is enough.)
+
+---
+
+## 7. Constraint honored
+
+No implementation code, no files created, no large snippets—design and decisions only.
+
+---
+
+## Recommended starting point
+
+1. **Architecture:** Option B — handlers → image service → `Store` interface → in-memory (SQLite later).
+
+2. **Core components:**  
+   - `cmd/server` (wiring, `ListenAndServe`, limits/config)  
+   - `internal/httpapi` (routes, status/headers)  
+   - `internal/images` (validate, metadata, crop, batch+cancel)  
+   - `internal/store` (`Store` + `memory`; optional `sqlite`)
+
+3. **Initial data model (conceptual):**  
+   `ID`, `Format`, `Width`, `Height`, `Size`, `CreatedAt`, `UpdatedAt`, `Bytes`  
+   API JSON exposes metadata without raw bytes; data endpoint returns bytes.
+
+4. **First Git commit:**  
+   `chore: scaffold Go module and server entrypoint`  
+   (layout + runnable stub + README how to run/test)
+
+5. **First implementation milestone:**  
+   Memory store + `POST /v1/images` + `GET .../metadata` + `GET .../data` roundtrip under `go test` — proves the vertical slice before validation/batch.
+
+6. **Top engineering risks:**  
+   - Trusting `Content-Type` / filename instead of decoding bytes  
+   - Unbounded memory (no max body / batch size) → easy DoS in review  
+   - Batch cancellation not wired to `r.Context()` (easy to fake concurrency, miss the actual requirement)  
+   - Re-encoding on every store (breaks byte identity; complicates tests)  
+   - Over-building SQLite/migrations/auth before the API is correct  
+   - Strict vs clip bbox left undocumented → flaky evaluator expectations  
+
+If you want a next step, we can lock the exact JSON metadata schema and batch response shape (field names only, still no code) before you start Stage 1.
+
+---
+
+**User**
+
+Review the proposed design once more for unnecessary complexity.
+
+Identify only the 3-5 decisions I should lock in before coding, with a one-sentence rationale for each.
+
+Do not write code. Do not propose additional architecture. Then stop.
+
+---
+
+**Cursor**
+
+Checking the scaffold so the locked decisions match what you already started.
+
+---
+
+**User**
+
+I am leaning toward a simple integer ID rather than UUID for this assignment.
+
+UUID gives useful properties for distributed systems, but this service is a small single-service application with no stated requirement for distributed ID generation or globally unique identifiers. An integer primary key also makes the API simpler and easier to inspect manually.
+Challenge this decision if you think UUID provides a meaningful benefit for this particular assignment and scope. I don’t want to add complexity without a concrete reason.
+
+---
+
+**Cursor**
+
+**Don’t use UUID for this assignment.** Your reasoning is sound.
+
+Integer IDs fit a single-process service with no auth, no multi-writer ID space, and no merge/federation story. UUID’s usual wins (unguesable IDs, cross-node uniqueness) don’t buy you anything evaluators will care about here—especially with an open API where knowing `id=3` exists is not a meaningful security boundary.
+
+Concrete upsides of integers for *this* scope:
+- Easier manual/`curl` inspection
+- Natural for in-memory counter and later SQLite `INTEGER PRIMARY KEY`
+- Avoids an extra dependency or ID-format validation theater
+
+The only thing to get right: allocate IDs under the same lock (or `atomic`) as the store write so concurrent creates don’t collide. That’s simpler than UUID generation, not more complex.
+
+**Lock it:** server-assigned monotonic `int64` (or `int`), stringified in the URL if you prefer (`/v1/images/1`), documented as local to this process/DB.
+
+---
+
+**User**
+
+alright, that sounds good. Yes protecting the regular go map by locking with mutex is preferable, even from the very start to keep a good practice. if moving to SQLite we can lock the transaction/row in the table before writing to that id.
+
+next, I want image validation and metadata extraction to happen in the service/domain layer rather than in the HTTP handlers or storage implementation.
+My reasoning is that the same validation rules should apply regardless of whether the request comes from POST, PUT, or batch, and storage should not need to understand image formats. Challenge this boundary if you see a concrete reason to place any part of this responsibility elsewhere.
+
+---
+
+**Cursor**
+
+**Keep validation and metadata extraction in the service.** That boundary is right for this assignment.
+
+Handlers should only parse transport shape (path/query, raw body or multipart parts, status/headers) and pass bytes + IDs into the service. Storage should persist opaque `[]byte` plus fields the service already filled in—it should not call `image.Decode` or interpret formats.
+
+Shared POST / PUT / batch rules are exactly why this belongs in one place: one decode/validate path, one set of limits, one metadata shape.
+
+**One nuance, not a relocation:** enforce the max size at the HTTP edge with `MaxBytesReader` (and again in the service if you accept an `io.Reader`/`[]byte`) so you never buffer an unbounded body before the domain runs. That is transport DoS protection using the **same** limit the service owns—not “image validation in the handler.” Multipart framing stays in the handler; per-part image rules stay in the service.
+
+**SQLite note:** row/DB locking is the store’s problem; it still should not learn JPEG vs PNG. Your mutex-on-map → SQL transaction evolution stays behind the store interface.
+
+---
+
+**User**
+
+great. now next to bbox, i am leaning toward treating it as a read-time transformation rather than something that affects stored data.
+the original image should remain immutable in storage, while GET /data with bbox decodes the original, validates the coordinates against the stored dimensions, crops it, and encodes the result for the response. 
+This seems to keep storage simple and makes the distinction between stored data and derived representations clear. Challenge this if there is a better design for this assignment.
+
+---
+
+**Cursor**
+
+**Don’t challenge it — read-time crop is the right design for this API.**
+
+`bbox` is a GET query on `/data`, so it is a derived view, not a write. Keeping the stored bytes immutable means storage stays a dumb `id → bytes + metadata` map, PUT/POST semantics stay simple, and you never invent a cache of cropped variants the assignment never asked for.
+
+Validate `bbox` against the stored width/height (reject OOB with 400), decode → crop → encode only for that response. The only cost is CPU per cropped GET; for this scope that is the correct tradeoff, not a reason to persist derivatives.
+
+---
+
+**User**
+
+For batch uploads, I am planning a fixed-size worker pool rather than spawning one goroutine per image.
+
+the goal is to bound CPu and memory usage when a client submits a large batch, while still processing independent images concurrently. I also want request cancellation to propagate through the workers so a disconnected client does not leave unnecessary work running.
+
+is there any important concurrency or cancellation edge case in this design that I should account for before implementing it?
+
+---
+
+**Cursor**
+
+Your pool design is sound. The edge cases worth designing for up front:
+
+**1. Cancel ≠ per-item failure**  
+Only `r.Context()` cancellation should stop the pool. A bad image is a per-item error; other workers should keep going. If you wire “first error cancels everything,” you break partial success.
+
+**2. What cancel can and cannot interrupt**  
+Cancel should stop **taking new jobs** and skip **store writes** once `ctx` is done. `image.Decode` is generally not abortable mid-call—one in-flight decode may finish. That is acceptable; the requirement is “don’t keep unnecessary work running,” not hard-preempt CPU.
+
+**3. Orphan creates after disconnect**  
+Work that already passed validation may still `Create` unless you check `ctx` immediately before the store write. Even then, successfully stored images before disconnect usually **stay** (compensating deletes are not worth it here). Document that; don’t build rollback.
+
+**4. Bound memory, not only goroutines**  
+A pool caps CPU concurrency; it does **not** cap memory if you first load every multipart part into `[]byte`. Cap **batch count** and **per-image size** (and multipart total size). The pool and the size limits solve different problems.
+
+**5. Don’t leak workers; write the response once**  
+`WaitGroup`/`errgroup`-style wait so handler return doesn’t leave goroutines behind. Aggregate results (by index) under a mutex or via a results channel, then write JSON **once**. On disconnect you often cannot send that body—cancellation is still doing its job by stopping work.
+
+**6. Preserve input identity in errors**  
+Record failures with part index and/or filename so the partial-success response stays usable under concurrency.
+
+Skip: per-image transactions spanning the batch, cancel-driven cleanup, and dynamic pool sizing. Fixed pool + shared request `ctx` + per-item errors is enough.
+
+---
+
+**User**
+
+I want to get the project into a clean, runnable state before adding any real API functionality.
+
+I have already started writing the code for the handlers/service/store, but not doen yet. please inspect what is already there and complete only the minimal skeleton/setup needed so that: go run ./… starts the http server locally without errors.
+
+For this change, do NOT implement the actual image APIs yet. I only want the project wiring and basic setup working.
+
+The structure I want to keep is the thin service + store interface design we agreed on:
+- internal/store/store.go: in-memory store implementation
+- internal/service/setup.go: image service setup
+- internal/httpapi/handlers.go: HTTP handler setup
+- cmd/server/main.go: application/server setup
+
+Use the existing code where possible rather than rewriting everything.
+
+The store should be an in-memory implementation for now. It should be safe for concurrent access and have the basic structure needed for the image service, but don’t implement unnecessary functionality yet.
+
+The service should depend on the store interface, not directly on the concrete in-memory store.
+
+The HTTP API should be wired to the service, but don’t implement the actual endpoint behavior yet. A minimal health/root response or placeholder is fine if needed to verify the server works.
+
+Also add a design-choices.md file documenting the decisions we have already made based on the assignment review desing you provided, and the clairfying questions I had with what we agreed upon. We are going with option B regarding the architecture option, since it has the perfect balance between tradeoffs for the scope of this assignment. :
+- thin handlers -> service -> store interface
+- in-memory storage for the first implementation
+- integer IDs, not UUIDs
+- IDs are server-assigned and unique within the running store
+- image validation and metadata extraction belong in the service
+- HTTP edge can enforce the image size limit with MaxBytesReader
+- store treats image data as opaque bytes
+- original uploaded bytes are stored unchanged
+ bbox is a read-time transformation and does not modify stored data
+- POST creates, PUT replaces an existing image and does not upsert
+- JPEG, PNG and GIF are the initial supported formats
+- bounded batch concurrency and request-context cancellation will be used later
+- SQLite is intentionally not part of the first implementation, but the store interface is designed so it can be added later
+
+Keep the design simple. Do not add extra layers, frameworks, configuration systems, authentication, caching, pagination, or other production features that the assignment does not need.
+
+After making the changes, run gofmt and verify that: go run ./… works cleanly.
+
+Do not implement POST /v1/images or GET /v1/images yet.
+
+Once everything is working, summarize what you changed and why, and stop.
+
+---
+
+**Cursor**
+
+I'll inspect the existing packages and wire a minimal runnable skeleton without implementing the image APIs.
+
+Aligning the layout with `internal/service`, stripping premature API behavior, and wiring a minimal runnable server plus `design-choices.md`.
+
+### What changed
+
+**Wiring (runnable skeleton only)**  
+- [`cmd/server/main.go`](cmd/server/main.go) — builds memory store → service → HTTP server, listens on `PORT` or `:8080`.  
+- [`internal/service/setup.go`](internal/service/setup.go) — service package (replaces `internal/images`); depends on `store.Store`; keeps shared types/limits, no API methods yet.  
+- [`internal/httpapi/handlers.go`](internal/httpapi/handlers.go) — wired to the service; only `GET /healthz` (no image routes).  
+- [`internal/store/store.go`](internal/store/store.go) — `Store` interface + concurrent `MemoryStore` (`RWMutex`, `nextID`, `map[int64]ImageRecord`); no CRUD yet.  
+- Removed [`internal/images/service.go`](internal/images/service.go).  
+- Added [`design-choices.md`](design-choices.md) with the locked decisions (Option B, integer IDs, validation in service, bbox read-time, etc.).
+
+**Why**  
+Get a clean `handlers → service → store` skeleton that starts without implementing image APIs or extra infrastructure.
+
+**Verified**  
+- `gofmt` applied  
+- `go build ./...` OK  
+- `go run ./cmd/server` serves `GET /healthz` → `{"status":"ok"}`
+
+---
+
+**User**
+
+perfect. do not change any code, simply merge the desing-choices.md into the readme.md file. Make sure the readme is complete, including evrything we've discussed and agreeed upon, including the result from my clarifying questions. also include section of how the project is structures (files/folders and what they do), setup guide (which will be updated as we go) and add necessary imforamtion from your assignment Design review notes (i like the format you made and the content, but don't make the readme too long, only include the important things). 
+
+---
+
+**Cursor**
+
+I'll merge the design decisions into a complete README and remove the standalone design-choices file so there's a single source of truth.
+
+Cleaning up the structure table now that `design-choices.md` is fully merged.
+
+Merged everything into [`README.md`](README.md) and removed [`design-choices.md`](design-choices.md) so there’s a single doc.
+
+The README now covers setup, project structure, planned API, design choices (Option B + locked decisions), clarifying-question outcomes, HTTP status cheat sheet, current status, and submission notes—kept concise, no other code changes.
+
+---
+
+**User**
+
+perfect. just one thing, I am missing the filename in the metadata image representation (internal/service/setup.go), isn't that necessary or good to have? 
+
+---
+
+**Cursor**
+
+**Not necessary.** The assignment only requires filesize, dimensions, type, and upload time. Filename is an optional “extra field,” not a correctness requirement.
+
+**Often not available.** `POST /v1/images` and `PUT` take a raw body — there is usually no filename unless you invent one. Only multipart batch naturally has part filenames, and those are client-supplied (untrusted, can collide or be empty).
+
+**Where it *is* useful:** on **batch errors** (you already have `BatchItemError.Filename`) so the client can tell which part failed. That does not require storing filename on every successful image.
+
+**If you add it anyway:** treat it as optional display metadata (`omitempty`), never as identity or format truth, and accept empty/`""` for single-image uploads. It is a nice-to-have for list UX, not something you need to lock before implementing the API.
+
+---
+
+**User**
+
+add file name as optional data metadata, it's nice to have as part of the metadata. 
+But one thing. the metadata alrady has the filesize, dimensions, imagetype, uploaddate but in store.go we have imagerecord that repeats these (filesize, width, height, imagetype). Explain why you did it this way. for me metadata should directly be referenced for that record in imagerecord struct, not repeated as individual fields. Did I miss something? 
+
+
+---
+
+**Cursor**
+
+You didn’t miss a hidden requirement — the duplication is intentional layering, not something the assignment forces.
+
+**Why it was split**
+
+- `Metadata` is the **API-facing** shape (JSON tags, `dimensions` as a nested object, no raw bytes).
+- `ImageRecord` is the **persistence** shape (must include `Bytes`, and flat `Width`/`Height` are easier for a map or later SQLite columns than `map[string]int`).
+
+So the repeat is “DTO vs storage model,” not two sources of truth at runtime. The service would map one → the other on read/write.
+
+**Your instinct is fine for this scope**
+
+For a small service, repeating those fields is mild ceremony. A cleaner model that matches what you want:
+
+```go
+type ImageRecord struct {
+    Metadata Metadata // id, filesize, dimensions, type, upload_date, optional filename
+    Bytes    []byte   // opaque; never part of list/metadata JSON
+}
+```
+
+That keeps “the record *has* metadata” without copying fields, and still keeps bytes out of the public metadata representation.
+
+**One caveat if you embed `Metadata` as-is**
+
+`Dimensions map[string]int` is a bit awkward in the store (and for SQLite later). Either:
+
+- keep `Width`/`Height` on the store side and map at the boundary, or  
+- change `Metadata` to `Width`/`Height` ints and let JSON be `"width"` / `"height"` (often clearer anyway).
+
+**Filename**
+
+Add it as optional on `Metadata` only, e.g. `Filename string \`json:"filename,omitempty"\``. Empty for raw-body POST/PUT; set from multipart when present. Don’t treat it as identity or format truth.
+
+**Bottom line:** Separate structs weren’t wrong; for this assignment, `ImageRecord { Metadata; Bytes }` is a good simplification. Prefer that over maintaining parallel field lists — just be deliberate about the dimensions shape.
+
+---
+
+**User**
+
+ok, yes. Add the filename as optional field in metadata. Also if we reference the same metadata like I suggested, is that easily implemented in sql lite? I imagine both the IMagerecord and metadata are stored in database later (if we decide to). And I agree if we directly map metadata inside imagerecord, it's better to have dimensions to width/height ints instead of slice of ints. would liek to represent it like this, any reason not to, other than what you said? would you recommend it? type ImageRecord struct {
+    Metadata Metadata // id, filesize, dimensions, type, upload_date, optional filename
+    Bytes    []byte   // opaque; never part of list/metadata JSON
+}
+
+---
+
+**Cursor**
+
+**Yes — I’d recommend that shape**, with `Width`/`Height` ints on `Metadata` (not a map), plus optional `Filename`. For this assignment it’s simpler and maps cleanly to both memory and SQLite.
+
+### SQLite fit
+
+You would **not** store “ImageRecord” and “Metadata” as two entities. One row is enough:
+
+| columns | … |
+|---------|---|
+| `id`, `filesize`, `width`, `height`, `image_type`, `upload_date`, `filename`, `data` (BLOB) |
+
+In Go, `ImageRecord { Metadata; Bytes }` is just how you group those fields. On read/write you map columns ↔ struct fields (stdlib `Scan` into locals, then fill the struct). Embedding does **not** require a nested JSON blob or a second table.
+
+### Any reason not to?
+
+Only structural ones:
+
+1. **Package direction** — If `Metadata` lives in `internal/service` and `store.ImageRecord` embeds it, **store imports service** (wrong way). Put the shared metadata type in `store` (or a tiny `internal/model`), and let HTTP/service use that type (or a thin alias).
+2. **JSON vs storage** — Keep `Bytes` off API responses (only `Metadata` in list/get-metadata). Don’t `json.Marshal` the whole `ImageRecord` for those endpoints.
+3. **No ORM magic** — embedding won’t auto-hydrate from SQL; you still assign fields. That’s fine at this size.
+
+Nothing else important argues against it for this scope.
+
+### Recommendation
+
+```text
+Metadata: ID, Filesize, Width, Height, ImageType, UploadDate, Filename (omitempty)
+ImageRecord: Metadata + Bytes
+```
+
+Do that. I’m in **Ask mode** so I can’t edit the files — switch to Agent mode if you want those struct changes applied for you.
+
+---
+
+**User**
+
+okay, yes please make only this change we've agreed upon.
+
+---
+
+**Cursor**
+
+I'll update the metadata/`ImageRecord` shape only: shared `Metadata` with width/height and optional filename, embedded in the store record.
+
+Done. Summary of the change:
+
+- **`store.Metadata`** — shared type with `width`/`height` ints and optional `filename`
+- **`store.ImageRecord`** — `{ Metadata, Bytes }`
+- **Service** — uses `store.Metadata` in batch response; no duplicate metadata struct
+- **README** — metadata shape updated to match
+
+`go build ./...` succeeds.
+
+---
+
+**User**
+
+Now let’s add the first real in-memory vertical slice.
+
+Implement only these two endpoints:
+GET /v1/images
+POST /v1/images
+
+GET /v1/images should return metadata for all currently stored images.
+
+POST /v1/images should accept the image itself as the raw HTTP request body. The client sends the actual image bytes, not a file path.
+
+For example, this should work:
+
+curl -X POST http://localhost:8080/v1/images 
+–data-binary @testdata/image.jpg
+
+The handler should read the request body, apply the agreed HTTP-level size limit, and pass the image bytes to the service.
+
+The service should:
+
+- validate that the body contains a supported image
+- derive the format, dimensions and filesize from the actual bytes
+- assign the next integer ID
+- store the original bytes unchanged
+- return the resulting metadata
+
+Do not trust Content-Type or filenames as the source of truth for the image metadata.
+
+Use the existing service/store boundaries. Don’t bypass the service from the handler and don’t make the store responsible for image decoding or validation.
+
+For POST:
+
+- success should be 201
+- return the created image metadata
+- include a Location header pointing to /v1/images/
+
+For GET:
+- success should be 200
+- return the metadata for all stored images
+- an empty store should simply return an empty list, not an error
+
+Use sensible 400/413/415/500 handling where applicable, but don’t create an elaborate error framework.
+Keep the implementation simple and consistent with design-choices.md.
+
+Run gofmt and go test ./… after the changes.
+
+Don’t implement PUT, bbox, batch, SQLite, or other endpoints yet.
+Once this works, summarize the changes and stop.
+
+---
+
+**Cursor**
+
+Implementing the GET/POST `/v1/images` vertical slice through the existing handler → service → store layers.
+
+### Vertical slice done
+
+**Store** — `Create` / `List` on the interface; memory impl assigns integer IDs, copies bytes, lists newest-first.
+
+**Service** — `CreateImage` uses `image.DecodeConfig` (jpeg/png/gif) for format + dimensions + filesize from bytes; `ListImages` returns `[]` when empty.
+
+**HTTP** — `POST /v1/images` with `MaxBytesReader` → 201 + `Location` + metadata; `GET /v1/images` → 200; 400 / 413 / 500 as agreed.
+
+**Tests** — store, service, and handler coverage; `gofmt` + `go test ./...` pass.
+
+**README** — setup curls and status updated for these two endpoints.
+
+---
+
+**User**
+
+Add comments to the code, for clarity and easier for others who read to understand. do not make any code changes. 
+
+---
+
+**Cursor**
+
+I'll add clarifying comments only—no logic or behavior changes.
+
+Added package-, type-, and method-level comments across `cmd/server`, `httpapi`, `service`, and `store` explaining boundaries, ID assignment, byte copying, validation from payload bytes, and HTTP status mapping. No behavior changes; `go test ./...` still passes.
+
+---
+
+**User**
+
+I have tested the application for the two endpoints and seems to work and tests are already there, but just in case add tests that are missing for the functionality we just implemented.
+
+Keep this focused on GET /v1/images and POST /v1/images. Don’t test functionality that doesn’t exist yet.
+
+I want the tests to verify at least:
+
+- POST accepts valid JPEG/PNG/GIF image bytes
+- POST returns 201
+- POST returns the expected metadata
+- the assigned ID is returned
+- Location header is correct
+- the uploaded bytes are actually stored
+- GET returns the stored metadata
+- GET on an empty store returns an empty list
+- invalid/non-image data is rejected
+- an oversized request is rejected
+
+Prefer httptest for the HTTP-level tests and generate small test images in the tests rather than adding binary image files to the repository unless there is a good reason to do otherwise.
+
+Also make sure the tests exercise the service/store boundaries rather than reaching directly into implementation details unnecessarily.
+
+Run:
+gofmt
+go test ./…
+go test -race ./…
+
+Fix anything that fails.
+Don’t add tests for PUT, bbox, batch, or SQLite yet.
+
+---
+
+**Cursor**
+
+I'll review the existing tests against your checklist and fill any gaps for GET/POST only.
+
+Gaps: JPEG/GIF coverage, fuller metadata checks, and verifying stored bytes. I'll add a store `Get` (boundary only—no new HTTP routes) so tests can assert bytes without poking internals.
+
+### What’s covered now
+
+**HTTP (`httptest`)** — JPEG/PNG/GIF → 201, full metadata, ID, `Location`, bytes verified via `store.Get`; GET list + empty list; invalid/empty → 400; oversized → 413.
+
+**Service** — same format cases + stored-byte check through the store; empty/invalid/too-large; empty list.
+
+**Store** — create/get/list, defensive byte copy, not-found, concurrent creates (for `-race`).
+
+Added `store.Get` so tests can assert stored bytes through the store boundary (no new HTTP routes).
+
+`gofmt`, `go test ./...`, and `go test -race ./...` all pass.
+
+---
+
+**User**
+
+for the GET /v1/images/<id>/data
+Get image data for image with id <id>.
+endpoint, should it only return the data-binary of the image or also the metadata? right now I have implemented that endpoint and it works, but returns the data binary as well as metadata, the instructions are not clear from my persoective. What is best practices and accoriding to what we've discussed and what the isntructions are, which one is best choice? 
+right now it gives :
+{
+    "Metadata": {
+        "id": 1,
+        "filesize": 22979,
+        "width": 250,
+        "height": 289,
+        "image_type": "jpeg",
+        "upload_date": "2026-09-10T20:34:13Z"
+    },
+    "Bytes": ""
+}
+
+---
+
+**Cursor**
+
+Checking how that endpoint is implemented so the advice matches your code.
+
+**Return only the image bytes — not metadata, and not JSON.**
+
+The assignment splits the concerns on purpose:
+
+- `GET /v1/images/<id>` → metadata (JSON)
+- `GET /v1/images/<id>/data` → **image data** (raw body), with optional `?bbox=...` cutout later
+
+That matches what we locked in: POST uploads raw bytes; `/data` should give those same bytes back (or a cropped derivative), with headers like `Content-Type: image/jpeg|png|gif` and `Content-Length`.
+
+### Why your current response is the wrong shape
+
+`writeJSON(..., record)` encodes an `ImageRecord` as JSON. `[]byte` becomes **base64** (often looking empty/odd in some clients), and you leak an internal storage shape (`Metadata` + `Bytes`) instead of serving an image. A browser or `curl -o out.jpg` cannot treat that as a picture.
+
+### What “best” looks like here
+
+```http
+HTTP/1.1 200 OK
+Content-Type: image/jpeg
+Content-Length: 22979
+
+<raw jpeg bytes>
+```
+
+No metadata in the body. Clients that need both call metadata and `/data` separately (or use list/create responses they already have).
+
+### Small related fixes to keep in mind
+
+- Map missing ID → **404**, not always 500.
+- Set `Content-Type` from stored `image_type` (derived at upload), not from guessing again unless you prefer to.
+
+**Bottom line:** `/data` = binary image response. Metadata stays on the metadata endpoints. Your current JSON wrapper should be changed.
+
+---
+
+**User**
+
+perfect, then fix this to work for endpoint GET /v1/images/<id>/data
+Get image data for image with id <id>. only returning the bytes of the image. Do NOT make any other changes, only change this so that the code works.
+
+---
+
+**Cursor**
+
+Fixing the broken `GetImageData` return and having the handler write raw image bytes (not JSON).
+
+The store's `Get` signature is inconsistent — checking and aligning it so the data endpoint can compile.
+
+`GET /v1/images/{id}/data` now returns the raw image bytes with the correct `Content-Type` / `Content-Length` (no JSON). Missing IDs map to 404. Also repaired a broken `store.Get` signature so the project builds again. `go test ./...` passes.
+
+---
+
+**User**
+
+add testing for the implemented GET /v1/images/<id>/data
+Get image data for image with id <id>.
+
+---
+
+**Cursor**
+
+I'll add focused tests for `GET /v1/images/{id}/data` against the current handler behavior.
+
+Added coverage for `GET /v1/images/{id}/data`:
+
+**HTTP** — PNG/JPEG/GIF round-trip (exact bytes, `Content-Type`, `Content-Length`, not JSON); 404 unknown ID; 400 invalid ID.
+
+**Service** — `GetImageData` returns stored bytes + metadata; not-found → `ErrNotFound`.
+
+Tests pass.
+
+---
+
+**User**
+
+Everything seems to be working well with the three enpoints and I’ve tested the application myself in Postman.
+One thing I noticed: when I use /v1/images/{id}/data with a very large image, Postman displays it at its full size, which makes it a bit awkward to inspect.
+Is there a good way to handle this without changing the actual API behavior or altering the original image data? I don’t want to introduce something unnecessary just for Postman’s display, so challenge the idea if this should simply be considered a client/display concern. but would be good to have a standard scaling of the image in case I want to add a frontend to the application.
+
+---
+
+**Cursor**
+
+**Treat Postman’s full-size preview as a client/display concern.** Do not change the API or stored bytes for that.
+
+`GET /v1/images/{id}/data` is meant to return the original image (or a bbox cutout later). Making the server shrink images because Postman is awkward would muddy the contract and isn’t what an evaluator expects.
+
+### What to do instead
+
+| Need | Approach |
+|------|----------|
+| Inspect in Postman | Save the response (`Send and Download`) and open locally, or use a viewer that fits the window. |
+| Future frontend | Scale in the UI (`max-width` / `object-fit` on `<img>`). That doesn’t touch the API or originals. |
+| Optional later API | Same pattern as `bbox`: a **read-time** query (e.g. max width) that decodes → resizes → encodes for the response only. Keep originals immutable. |
+
+### Recommendation for this assignment
+
+**Don’t add scaling now.** Three working endpoints + immutable storage is the right scope. A frontend can display large images fine without a resize API.
+
+If you later want server-side previews for bandwidth, add it as an explicit derived view (query param or `/thumbnail`), not as a change to default `/data` behavior—and not for Postman’s sake.
+
+---
+
+**User**
+
+I have implemented the endpoint GET /v1/images/<id>
+Get metadata for image with id <id>. And it seems to work when I test it. Please review the code and make any changes necessary (only to that endpoint), ensure that all test cases are covered along with erro handling. Also one thing, I see that in the store package, when we return a errors/notok then we are not consistent with the object we return, some functions return empty object of metsdata/image bytes while other return nil along with the error. Make it consistent, use best practices. I prefer returning nil for the object we are returning but keep the empty object if it's better/standard practice and if it requires less code change overall. Try to go with the option that has less lines of code changed from my current implementeation.
+
+---
+
+**Cursor**
+
+I'll review the get-by-id metadata endpoint and store error-return consistency, then fix only what's needed and add missing tests.
+
+Fixing a handler bug that never maps 404, wiring `GetMetadata` into the store interface for this endpoint, keeping Go’s `T{}, err` idiom for structs (less churn than pointers), and adding tests.
+
+### Fixes
+- **Bug:** `handleGetImageMetadata` checked `ErrNotFound` on the *parse* error (always wrong), so missing IDs became **500**. Now 404 is mapped from the service/store error.
+- **Service** uses `store.GetMetadata` (no unnecessary byte copy).
+- **`GetMetadata`** added to the `Store` interface so your existing method is part of the contract.
+
+### Error return consistency
+Kept **`Metadata{}` / `ImageRecord{}, err`** for structs — that’s idiomatic Go (you can’t return `nil` for a non-pointer). Slices like `List` correctly use **`nil, err`**. Switching everything to pointers would be more churn for no real gain.
+
+### Tests added
+HTTP + service + store: success, 404 not found, 400 invalid ID.
+
+`go test ./...` and race tests pass.
+
+---
+
+**User**
+
+in setup.go, why did you remove the error handling for the GetIMageMetadata function? 
+
+---
+
+**Cursor**
+
+It wasn’t removed — it was inlined.
+
+```73:76:internal/service/setup.go
+// GetImageMetadata returns metadata for the image with the given id.
+func (s *Service) GetImageMetadata(ctx context.Context, id int64) (store.Metadata, error) {
+	return s.store.GetMetadata(ctx, id)
+}
+```
+
+`GetMetadata` already returns `(Metadata, error)`. A direct `return` still passes through `ErrNotFound` (and any other error) plus the zero `Metadata` on failure. This:
+
+```go
+meta, err := s.store.GetMetadata(ctx, id)
+if err != nil {
+    return store.Metadata{}, err
+}
+return meta, nil
+```
+
+is the same behavior with more lines.
+
+The old version also had to unwrap `record.Metadata` after `Get`. Now the store returns metadata directly, so there’s nothing to transform — only forward the result.
+
+HTTP still handles errors in the handler (`errors.Is(..., store.ErrNotFound)` → 404). The service doesn’t need its own branch unless you want to map or wrap store errors into service-level types.
+
+---
+
+**User**
+
+yes I see now, missed it at first. why do we not copy image bytes for Get and not for getmetadata? 
+
+---
+
+**Cursor**
+
+**`Get` copies bytes because it hands out a mutable `[]byte`. `GetMetadata` doesn’t, because it never returns those bytes.**
+
+In the store, image data lives in `records[id].Bytes`. A Go slice is a header pointing at an underlying array. If `Get` returned that slice as-is, the caller could do `rec.Bytes[0] = ...` and **corrupt what’s in the store**. So `Get` copies into a new slice before returning.
+
+`GetMetadata` only returns `Metadata` (ints/strings). That’s a **value** — assigning `out := rec.Metadata` copies the fields. There’s no shared buffer to mutate, so no defensive copy is needed (and skipping it avoids pointless work when you only need metadata).
+
+That’s why the metadata endpoint uses `GetMetadata`: same correct metadata, without paying for a full image copy.
+
+---
+
+**User**
+
+i see but back to last question, why doesn't we inline the other functions as well, like we've doen the GetImageMetadata? any reason why? challange the idea if you have a good reason to keep it this way.
+
+---
+
+**Cursor**
+
+**`GetImageData` can be inlined the same way.** There’s no good reason to keep the verbose form — it’s leftover style, not a design choice.
+
+```go
+func (s *Service) GetImageData(ctx context.Context, id int64) (store.ImageRecord, error) {
+	return s.store.Get(ctx, id)
+}
+```
+
+Same as `GetImageMetadata`: store already returns `(ImageRecord, error)` with zero value + error on failure.
+
+### The others are different
+
+| Method | Inline? | Why |
+|--------|---------|-----|
+| `GetImageMetadata` | Yes | Pure pass-through |
+| `GetImageData` | **Yes** (should) | Pure pass-through — current `if err` is redundant |
+| `ListImages` | Partially | The `nil` → `[]Metadata{}` guard is real: so JSON is `[]`, not `null`. Keep that (or fix `store.List` to never return a nil slice on success, then you can inline) |
+| `CreateImage` | No | Validation, decode, derived metadata — actual service logic |
+
+**Challenge to “keep GetImageData as-is”:** don’t. Make it match `GetImageMetadata` for consistency. Only keep expanded bodies where the service adds behavior.
+
+---
+
+**User**
+
+I have now implemented the PUT endpoint that takes a new image and Id and updates the binary data and metadata of image. Works for expected Filesize, and handles too large files correctly, but does not give correct expected error for put with new file format that is not supported. 
+Only change the code for the PUT endpoint I've implemented, add comments and fix the issue with the wrong error not showing. also check that the endpoint does what it's supposed to and all scenarios in the assignment. Then when finished, update the documentaton/readme to be up to date.
+
+---
+
+**Cursor**
+
+I'll inspect the PUT implementation and tests, fix the unsupported-format error path, then update the README.
+
+The PUT handler maps all service errors to 500, so unsupported formats never surface as 400. Fixing that error mapping and aligning PUT with create/replace semantics.
+
+### Root cause
+The PUT handler mapped **every** `UpdateImage` error to **500**, so unsupported/invalid images never returned **400** with `ErrInvalidImage`.
+
+### What changed
+- **Handler:** Maps errors like POST — 400 (empty/invalid), 413 (too large), 404 (missing id), 500 otherwise; returns the real error message for validation failures.
+- **Service:** Validates empty body + formats; replaces bytes/metadata; **keeps original `upload_date`**; no upsert.
+- **Store:** Ensures `meta.ID` on update; cleaned comments.
+- **Tests:** Success replace, invalid format → 400, not found, too large, bad id.
+- **README:** Setup curls, API table, and current status updated for PUT + existing endpoints.
+
+`go test ./...` passes.
+
+---
+
+**User**
+
+<timestamp>Friday, Sep 11, 2026, 1:28 PM (UTC+2)</timestamp>
+<system_notification>
+The following task has finished. If you were already aware, ignore this notification and do not restate prior responses.
+
+<task>
+kind: shell
+status: aborted
+task_id: 569110
+title: Check go run ./... behavior
+tool_call_id: call-30b53664-bed6-4317-9a20-03bfd472811b-22
+fc_387670f2-f052-97f6-997c-71afc1d7b947_0
+output_path: /Users/badimirzai/.cursor/projects/Users-badimirzai-Documents-go-projects-Image-Service-Assignment/terminals/569110.txt
+</task>
+</system_notification>
+<user_query>Briefly inform the user about the task result and perform any follow-up actions (if needed). If there's no follow-ups needed, don't explicitly say that.</user_query>
+
+---
+
+**Cursor**
+
+That background check of `go run ./...` from earlier was aborted — it wasn’t related to the PUT work, and nothing is left to fix from it.
+
+---
+
+**User**
+
+I’m adding optional ?bbox=x,y,w,h cutout to existing GET /v1/images/{id}/data for a read-time image cutout (assignment requirement).
+
+Design I’m leaning toward:
+Keep GetImageData as a pass-through of stored original bytes.
+- Add a separate service method GetImageCutout (decode -> validate strict in-bounds rect -> SubImage -> re-encode same format).
+- Handler branches on whether bbox is present; bad bbox → 400, missing id → 404.
+- No store changes - crop is response-only, originals stay immutable.
+- Stdlib only (image / jpeg/png/gif), no new deps or new route.
+Motivation: matches thin handler -> service → store; keeps the happy path simple; crop logic stays testable and doesn’t pollute storage or the existing GET.
+
+Challenge this. Is this Option (separate cutout method + query on /data) better than extending GetImageData with an optional bbox, a dedicated /cutout route, or persisting crops? What would you change for a small take-home Go service, and what’s overkill? keep response short.
+
+---
+
+**Cursor**
+
+**Your design is right for this assignment.** Keep crop as a read-time path on `/data`; don’t persist crops or add a `/cutout` route (the brief puts `bbox` on `/data`).
+
+**Separate `GetImageCutout` vs optional bbox on `GetImageData`:** both fine. Separate method keeps the no-bbox path trivial and is easy to unit-test — good choice. A single `GetImageData(ctx, id, bbox *Rect)` is equally valid and slightly fewer symbols; don’t overthink it.
+
+**Would change:** nothing structural. Strict in-bounds → 400, missing id → 404, re-encode in the stored format (PNG fallback only if you must).
+
+**Overkill:** crop cache, new route, store columns, non-stdlib imaging libs.
+
+---
+
+**User**
+
+I implemented optional ?bbox=x,y,w,h on existing GET /v1/images/{id}/data for an image cutout (Go image service take-home).
+
+Design:
+Thin handler -> service -> store. Store unchanged (opaque original bytes).
+Same route/handler: no bbox -> GetImageData (pass-through); with bbox -> ParseBBox then GetImageCutout.
+Why not a second mux route / separate handler: Go ServeMux doesn’t match query params; assignment says optional GET param on /data; avoids duplicated HTTP boilerplate.
+Cutout is read-time only: decode -> strict in-bounds rect (top-left origin, y down) -> SubImage -> re-encode same format. Bad bbox -> 400, missing id → 404.
+ParseBBox / GetImageCutout live in the service layer (not store).
+Known bug For animated GIFs, image.Decode + gif.Encode only handle the first frame, so a cropped GIF becomes a single static image. JPEG/PNG crop behave fine.
+
+Proposed fix Decode the full GIF (gif.DecodeAll), apply the same bbox crop to every frame, preserve delays/loop count, re-encode with gif.EncodeAll, so the cutout stays an animated GIF. I’m considering cropping frames concurrently with goroutines, but maybe that’s unnecessary.
+
+Challenge the overall design and this GIF plan. Is per-frame uniform crop the right approach? Should I use goroutines or keep it sequential? Any stdlib pitfalls (disposal, palettes, bounds)? What’s good enough for a take-home vs overkill?
+
+---
+
+**Cursor**
+
+**Overall design: keep it.** Same `/data` route + query branch, service-owned crop, immutable store is the right take-home shape. Don’t add a second route.
+
+**GIF plan: challenge hard.** Per-frame uniform crop *sounds* right, but stdlib GIFs are messy: frames often have **partial bounds**, **disposal methods**, and **local palettes**. Naive `SubImage` on each `gif.GIF.Image[i]` with the canvas bbox frequently breaks (wrong coords, empty frames, palette/disposal glitches). Doing it “correctly” means compositing onto a full canvas then cropping — real work, easy to get wrong.
+
+**Goroutines: skip.** Frame count is small; encode dominates; concurrency adds races around palettes/buffers for no evaluator win.
+
+**Good enough for the assignment:** Document that animated GIF cutouts become a **single-frame GIF** (first frame / `image.Decode` path), which you already note in code. JPEG/PNG are the serious cases. Optionally only special-case `gif.DecodeAll` when `len(frames)==1`.
+
+**Overkill:** full animated-GIF crop pipeline, worker pools, third-party GIF libs. Mention the limitation in the README in one sentence and move on.
+
+---
+
+**User**
+
+okay, understood. I have tested the bbox endpoint params, and seems to work. Anything else I should add/change overall for this endpoint? Test to see if it works as expected, from my side it looks done but give me anything missing.
+
+---
+
+**Cursor**
+
+I'll review the bbox cutout path end-to-end—implementation, tests, docs—and call out anything still missing.
+
+Gaps: no bbox tests, README still says it's unimplemented, and duplicate image imports. Adding tests, updating the README, and verifying.
+
+### What was missing
+
+1. **No automated tests** for `ParseBBox` / cutout / HTTP `?bbox=` (biggest gap).
+2. **README still said bbox wasn’t implemented.**
+3. Minor: duplicate `image/gif|jpeg|png` imports; bounds used stored metadata instead of decoded `Bounds()` (now fixed).
+
+### What I added/fixed
+
+- Service + HTTP tests: valid crop dims, storage unchanged, malformed/OOB/zero-size → 400, missing id → 404.
+- README: API row, curl example, GIF first-frame note, status updated.
+- Crop bounds from decoded image (+ `bounds.Min` offset).
+
+`go test ./...` passes. For this take-home, bbox is in good shape; remaining work is **batch**, not more crop polish.
+
+---
+
+**User**
+
+add comments on the test cases for clarity and esier to understand.
+
+---
+
+**Cursor**
+
+I'll add clarifying comments to the test files without changing test behavior.
+
+Adding short purpose comments on helpers and each test across the three test packages.
+
+Added short purpose comments on helpers and every test in `store`, `service`, and `httpapi` test files. Behavior unchanged; `go test ./...` still passes.
+
+---
+
+**User**
+
+I’m thinking about the batch upload endpoint and see a few possible approaches:
+A: parse all multipart parts in the handler, then pass the images to the service where a fixed worker pool processes them.
+B: stream parts directly into the worker pool so parsing and processing overlap.
+C: use something like errgroup/a semaphore instead of an explicit worker pool.
+
+I’m leaning towards A because it keeps the handler focused on HTTP/multipart concerns, keeps concurrency in the service, makes cancellation and partial success easier to reason about, and the batch limit is only around 10 images so the extra memory is acceptable.
+
+Do you agree, or is there a better tradeoff I’m missing?
+
+---
+
+**Cursor**
+
+**Agree with A** for this take-home.
+
+- **Handler:** parse `multipart/form-data`, enforce max parts / total size, collect `{name, bytes}` (or reject early).
+- **Service:** fixed worker pool (or semaphore), validate/store per item, aggregate successes + errors, respect `ctx` cancel.
+- **Why A wins here:** clear layering, easy to test, partial success is obvious, and with ~10–20 images the “load then process” memory cost is fine.
+
+**B (stream into pool):** better at large scale; more complex (backpressure, part lifetime, harder tests). Not worth it at your batch cap.
+
+**C (errgroup/semaphore):** fine implementation detail *inside* the service — not a competing architecture. `errgroup` that cancels on first error is **wrong** for partial success; use a semaphore/`errgroup` only if you still collect per-item errors and cancel solely on `ctx.Done()`.
+
+**Don’t miss:** empty batch → 400; wrong Content-Type → 415; per-part size limit; cancel stops scheduling / skips further writes (in-flight decode may finish); already-stored items can remain after disconnect.
+
+---
+
+**User**
+
+agreed, also too many will result in 400 (or should it be 429?), or should it ideally just handle tha max amount and agnore the ones that it did not have space to handle? 
+let's go with option A. 
+The handler will handle multipart parsing plus batch/size limits, collect (filename, batch), then call CreateBatch(ctx, items). 
+the service should use a fixed worker pool to reuse the same validation/Create logic as createIMage, collect per item success/errors, preserve input order, and respect ctx cancellation. all batch outcomes return 200. 
+for cancellation, stop scheduling new work and skip writes when contect is cancelled. images that are already stored will remain. 
+
+Does this setup look good? anything you would change before implementing? 
+
+---
+
+**Cursor**
+
+**Yes — ship that design.** Small tweaks only:
+
+### Too many parts
+Prefer **400** (“batch exceeds max N images”), not 429.  
+429 is for rate limiting / retry-later. Oversized batch is a client validation error.
+
+Don’t silently process the first N and drop the rest — surprising and harder to debug. Reject the whole request before any workers run.
+
+### Confirm / keep
+| Choice | Verdict |
+|--------|---------|
+| Option A (parse in handler → `CreateBatch`) | Good |
+| Fixed worker pool + reuse create validation | Good |
+| Partial success, always **200** with `success`/`errors` | Good (even if every item fails — still 200 with empty success; empty batch / bad multipart stay 400/415 *before* `CreateBatch`) |
+| Preserve input order in results | Good |
+| Cancel: stop scheduling + skip further writes; keep already-stored | Good |
+
+### Before you implement
+1. **Empty batch** (no file parts) → **400**, don’t call the pool.  
+2. **Non-multipart** → **415**.  
+3. Cap **per-part** size (same as `MaxImageSize`) while reading parts, not only total count.  
+4. Response shape: include something stable per failure (`index` and/or `filename`) so clients can map errors under concurrency.  
+5. Worker count: fixed constant (e.g. 4) is enough — no config framework.
+
+Nothing else I’d change for this assignment.
+
+---
+
+**User**
+
+the batch upload service side is done (i think). CreateBatch takes a list of items (filename + bytes), processes them concurrently with a fixed worker pool, returns partial success as success/errors JSON, and respects context cancel if the client disconnects. Single-image create was refactored so batch reuses the same validation/store path. Max batch size is 12, 4 workers.
+
+The route POST /v1/images/batch is registered and points at handleCreateBatch, but that handler is unfinished. finish It. should only do HTTP stuff: require multipart/form-data (415 otherwise), read the form parts named "images", enforce per-image size limit and max batch size, build the item list, call CreateBatch with the request context, and return 200 with the batch response (including partial success). Empty or oversized batch -> 400, part too large -> 413. No image format validation in the handler - the service already does it. Mirror how the other handlers are written. 
+
+Before I give you access to change the code, give me exactly an analysis of the endpint written and if it needs to be changed. Does this cover Everything as it should? anything i've missed? 
+
+---
+
+**Cursor**
+
+I'll review the batch service and unfinished handler against the assignment and our agreed design.
+
+## Verdict
+
+**Service direction is right** (pool, reuse `CreateFromBytes`, partial success, cancel semantics). It is **not fully solid yet** — one real concurrency bug risk, and the handler stub does not compile / is incomplete. Your planned handler shape is correct; a few HTTP details matter when you finish it.
+
+---
+
+## Handler (current stub)
+
+```204:216:internal/httpapi/handlers.go
+func (s *Server) handleCreateBatch(...) {
+	of ct == "" || !strings.HasPrefix(...)  // typo: "of" → "if"; strings not imported
+	form, err := r.MultipartForm()         // wrong API — need ParseMultipartForm first
+	// function never finishes / no CreateBatch call
+}
+```
+
+**Planned behavior (what you described) — good:**
+- 415 if not `multipart/form-data`
+- Only file parts named `"images"`
+- Empty → 400; `> MaxBatchSize` → 400; part `> MaxImageSize` → 413
+- No format checks in handler
+- `CreateBatch(r.Context(), items)` → always **200** + JSON on success path
+- Map `ErrEmptyBatch` / `ErrBatchTooManyImages` → 400 if service returns them (defense in depth)
+
+**Also do in the handler:**
+1. Cap the **whole body** (e.g. `MaxBytesReader` with `MaxBatchSize * MaxImageSize` or similar) before parse, or set a sensible `ParseMultipartForm(maxMemory)`.
+2. Read each part with a per-part size limit (`MaxBytesReader` on the part), not only after `ReadAll`.
+3. Ignore non-file fields; only `images` file parts.
+4. `mime/multipart` boundary: `HasPrefix(ct, "multipart/form-data")` is fine (allows `boundary=`).
+
+That covers the assignment’s HTTP side for batch.
+
+---
+
+## Service (`CreateBatch`) — what’s good
+
+- Empty / too-many checks before work  
+- Fixed pool (`BatchWorkers`, capped by `len(items)`)  
+- Reuses `CreateFromBytes` (same validation as single create + optional filename)  
+- Partial success assembled in input order  
+- Workers check `ctx.Err()` before starting an item  
+
+That matches Option A and the brief.
+
+---
+
+## Service — what I’d change before calling it done
+
+### 1. Cancel + `results` channel (important)
+
+On cancel, the **dispatcher** pushes synthetic errors for remaining indices **into `results`**, while **workers** may still push for jobs already taken. You can get **duplicate idx** or, worse, **block** if `results` fills (`buffer = len(items)`) while workers and dispatcher both send and the consumer isn’t keeping up in an edge timing.
+
+Safer pattern: only workers write to `results`; on cancel, close `jobs`, workers exit, and for any index with no result yet, mark cancelled in the main goroutine after the pool drains. Or use a `[]result` with mutex, one slot per index.
+
+### 2. Skip store write on cancel
+
+`CreateFromBytes` does not check `ctx` before `store.Create`. Workers only check before calling it — once decode starts, a disconnect can still **commit**. Checking `ctx.Err()` immediately before `Create` better matches “skip writes when cancelled.”
+
+### 3. Small cleanups (optional)
+
+- Unused `ErrBatchTooLarge` vs `ErrBatchTooManyImages` — keep one.  
+- Consider `index` on `BatchItemError` (filename alone can collide).  
+- No batch tests yet — add after the handler exists.
+
+---
+
+## Coverage vs assignment
+
+| Requirement | Status |
+|-------------|--------|
+| `multipart/form-data` batch | Handler unfinished |
+| Bounded concurrency | Yes (4 workers) |
+| Success metadata + per-item errors | Yes |
+| Cancel on client disconnect | Partially (scheduling yes; write skip / result fan-in need hardening) |
+| Same validation as single upload | Yes via `CreateFromBytes` |
+
+---
+
+## Bottom line
+
+**Finish the handler as you planned — that’s the right split.**  
+**Before / while wiring it:** fix cancel result ownership (only one writer path per index) and ideally gate `store.Create` on `ctx`. Everything else is polish.
+
+I’m in Ask mode so I can’t edit yet; switch to Agent when you want the handler completed and those service fixes applied.
+
+---
+
+**User**
+
+ok, yes finish the handlercreatedbatch and the changes you recommend. also add comments if necessary and update the documentation.
+
+---
+
+**Cursor**
+
+I'll finish the batch handler, harden CreateBatch cancellation, and update the README.
+
+### Done
+
+**Handler** — `handleCreateBatch` now:
+- Requires `multipart/form-data` (415)
+- Caps total body + per-part size (413)
+- Reads only `images` file parts; empty / >12 → 400
+- Calls `CreateBatch(r.Context(), …)` → **200** + partial-success JSON
+
+**Service** — Cancel-safe pool: only workers write results; unscheduled items marked cancelled after drain; `CreateFromBytes` checks `ctx` before `store.Create`.
+
+**Tests + README** — Batch HTTP/service coverage; docs/curl/status updated.
+
+`go test ./...` and `-race` pass.
+
+---
+
+**User**
+
+Bug: in handleCreateBatch, when one multipart part is over MaxImageSize we write 413 and return immediately. CreateBatch never runs, so valid images in the same batch are not stored. That breaks partial-success.
+
+Fix: stop aborting the whole request on a single oversized part. Skip adding that file to the items list (or record it as a per-item error), keep reading the other parts, call CreateBatch for the valid ones, then return 200 with success metadata plus an errors entry for the oversized file (use its filename and ErrTooLarge message). Only use 413 for a whole-request body limit, not for one bad item in a batch. try not to make too many chnages while fixing the bug.
+
+---
+
+**Cursor**
+
+I'll fix oversized multipart parts to become per-item errors in the 200 partial-success response instead of aborting with 413.
+
+Oversized multipart parts are now per-item errors in the **200** partial-success body; other images still go through `CreateBatch`. **413** remains only for the whole-request body limit. Added a regression test and a short README note.
+
+---
+
+**User**
+
+Let's do a final review and cleanup, suggestions. 
+Please:
+1. Read assignment-instructions.md carefully (source of truth for requirements).
+2. Read README.md.
+3. Review the entire codebase (cmd/, internal/httpapi, internal/service, internal/store, tests, go.mod).
+4. Run `go test ./...` and `go test -race ./...` if possible (readonly / verify only).I have run the tests myself, both the test files and tested the application and seems to work as expected.
+Deliverables:
+A) requr. matrix
+For each requirement in assignment-instructions.md, mark: done/partial/missing, with brief evidence (file/function). Include: endpoints, metadata fields, validation, HTTP status/headers, batch concurrency + partial success, client-disconnect cancel, “mergeable” quality, motivated tradeoffs, submission artifacts (git bundle notes, ai-transcript.txt).
+B) code quality review
+Architecture, correctness, concurrency, error handling, API semantics, test coverage gaps, README vs code drift, any bugs or footguns. Separate must-fix before submit vs nice-to-have.
+C) final verdict
+One of: ready to submit / ready after small fixes/ not ready.
+Then a prioritized checklist of remaining actions (docs vs code vs submission artifacts vs interview prep). Keep code change suggestions minimal and optional unless something is actually wrong.
+D) readme patch list
+Exact places in README.md that are stale/unclear, with minimal suggested replacement text (no full rewrite).
+Constraints:
+- In-memory storage is acceptable from my view for this assignment; I do not  see reason to require SQLite unless you find a real correctness gap.
+- Prefer honesty about cancel/partial-success semantics and status codes as implemented.
+- Keep the response scannable with checklists.
+
+---
+
+**Cursor**
+
+I'll review the assignment, README, and codebase, then run the tests for a final readiness assessment.
+
+## C) Verdict
+
+**Ready after small fixes** — functionally complete for the assignment; block submit only on **submission artifacts** (`ai-transcript.txt`, git bundle) and a few **README cleanups**. No SQLite required.
+
+`go test ./...` and `go test -race ./...` both **pass**.
+
+---
+
+## A) Requirements matrix
+
+| Requirement | Status | Evidence |
+|-------------|--------|----------|
+| Go service | **Done** | `go.mod`, `cmd/server` |
+| Validation | **Done** | `service.CreateFromBytes` / `UpdateImage` / `ParseBBox`; HTTP size limits in handlers |
+| Correct HTTP status codes | **Done** | Handlers map 200/201/400/404/413/415/500 |
+| Proper headers (`Content-Type`, etc.) | **Done** | JSON + `Location` on create; `Content-Type`/`Content-Length` on `/data` |
+| Motivated less-ideal choices / scalability note | **Done** | README Persistence + scaling path |
+| Nice commit history + **git bundle** | **Partial** | History looks incremental; **bundle not produced** in repo |
+| Deploy somewhere | **N/A** | Optional; not required |
+| **`ai-transcript.txt` if AI used** | **Missing** | File absent; AI was used → **required for submission** |
+| `GET /v1/images` | **Done** | `handleListImages` → `ListImages` |
+| `GET /v1/images/<id>` | **Done** | `handleGetImageMetadata` → `GetImageMetadata` |
+| `GET /v1/images/<id>/data` | **Done** | `handleGetImageData` → `GetImageData` |
+| `?bbox=x,y,w,h` cutout | **Done** | `ParseBBox` + `GetImageCutout` (read-time; first-frame GIF) |
+| `POST /v1/images` (raw body) | **Done** | `handleCreateImage` → `CreateImage` |
+| `PUT /v1/images/<id>` | **Done** | `handleUpdateImage` → `UpdateImage` (no upsert) |
+| `POST /v1/images/batch` multipart | **Done** | `handleCreateBatch` field `images` |
+| Batch bounded concurrency | **Done** | `CreateBatch`, `BatchWorkers=4` |
+| Batch partial success | **Done** | `BatchResponse{success,errors}`; HTTP **200** when accepted |
+| Client disconnect → cancel in-flight | **Partial / honest** | Stop scheduling + skip write if `ctx` done before `store.Create`; in-flight `DecodeConfig` may finish; already-stored kept. No mid-request disconnect integration test. |
+| Metadata: filesize, dims, type, upload time | **Done** | `store.Metadata` |
+| Extra metadata fields | **Done** | `id`, optional `filename` |
+| Performant / scalable (motivated) | **Done** | In-memory + Store seam documented |
+| Merge-to-main quality | **Done** | Layers, tests, race-clean; small polish left |
+
+---
+
+## B) Code quality review
+
+### Strengths
+- Clear **handlers → service → store** split; store is format-agnostic.
+- Bytes are source of truth; originals immutable; bbox is derived.
+- Batch: fixed pool, reuse `CreateFromBytes`, partial success, cancel without dual-writing results.
+- Solid unit/httptest coverage across formats, errors, bbox, batch.
+
+### Must-fix before submit
+1. **Add `ai-transcript.txt`** (assignment rule if AI tools used).
+2. **Create git bundle** as specified (`git bundle create …` — note their typo `--a11` → you want `--all`).
+3. **README drift / typos** (below) — especially duplicate “Current status”, and ensure batch max **8** is consistent (code is 8; good).
+4. Commit/stage **uncommitted README** (`MM README.md` on `main`).
+
+### Nice-to-have (optional)
+- Server `ReadHeaderTimeout` / graceful shutdown in `main`.
+- Batch error list preserves **full input order** when oversized parts are mixed with service failures (today: handler `partErrors` then `CreateBatch` errors).
+- `index` on batch error objects (filename collisions).
+- Stronger cancel test (cancel mid-batch, not only pre-cancelled ctx).
+- Trim large `test-images/` if bundle size matters (e.g. 11MB PNG) — not a correctness issue.
+- Rename `internal/service/setup.go` → `service.go` for clarity.
+
+### Footguns (document, don’t over-fix)
+- Animated GIF bbox → **first frame only** (already documented).
+- In-memory: data lost on restart (documented).
+- Cancel: not hard-preempt of decode; orphans possible (documented).
+
+### Tests
+- Pass with `-race`.
+- Gap: no httptest that simulates client abort mid-batch (optional).
+
+---
+
+## Prioritized checklist
+
+**Submission (do these)**
+- [ ] Export / add **`ai-transcript.txt`**
+- [ ] Fix README items in (D), commit
+- [ ] `git bundle create <name>.bundle --all` (verify restore)
+- [ ] Quick smoke: `go test ./...` + one curl batch/create
+
+**Docs only**
+- [ ] Apply README patch list (D)
+
+**Code (optional)**
+- [ ] None required for correctness of the brief
+- [ ] Optional: timeouts in `main`, batch error ordering, disconnect test
+
+**Interview prep**
+- [ ] Explain: trust bytes not Content-Type; PUT no upsert; bbox read-time; batch 200 + partial success; cancel semantics; why memory + Store interface
+
+---
+
+## D) README patch list (minimal)
+
+1. **Lines 216–217 — duplicate heading**  
+   Remove one `## Current status`.
+
+2. **Line 221 — broken markdown**  
+   Ensure a blank line before `---` (currently glued: `deployment.---`).
+
+3. **Lines 136–137 — duplicated cancel paragraph**  
+   Keep a single cancel blurb; delete the repeated sentence about disconnect.
+
+4. **Line 18 — Go version**  
+   Replace “Go 1.22+” with something accurate, e.g. **“Go version in `go.mod` (currently 1.25.x)”** — or lower `go.mod` if you want broader evaluators.
+
+5. **Line 97 — stale parenthetical**  
+   `crop, batch (as features are added)` → `validation, crop, batch`.
+
+6. **Line 153 — “SQLite later” in diagram caption**  
+   Fine if intentional; optional: “optional later” to match “deferred”.
+
+7. **Submission notes (bottom)**  
+   Add explicit steps:
+   - `git bundle create image-service.bundle --all`
+   - Include `ai-transcript.txt` when AI was used
+
+8. **Clone URL**  
+   Confirm `github.com/badimirzai/image-service-assignment` matches the real remote (module path is `image-service`).
+
+---
+
+**Bottom line:** Feature-complete and test-green. Treat **`ai-transcript.txt` + git bundle + README cleanup** as the submit gate; SQLite is not needed.
+
